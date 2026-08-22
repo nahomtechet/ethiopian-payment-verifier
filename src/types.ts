@@ -1,8 +1,16 @@
 import { PaymentProvider, BankMetadata, CBE, Telebirr, Dashen, Awash, BOA, Zemen, BANKS } from './banks.js';
-import { DuplicateStore, BlacklistStore, VelocityStore } from './stores.js';
+import { 
+  DuplicateStore, BlacklistStore, VelocityStore,
+  RedisDuplicateStore, RedisVelocityStore,
+  PrismaDuplicateStore, PrismaVelocityStore
+} from './stores.js';
 
 export { PaymentProvider, BankMetadata, CBE, Telebirr, Dashen, Awash, BOA, Zemen, BANKS };
-export { DuplicateStore, BlacklistStore, VelocityStore };
+export { 
+  DuplicateStore, BlacklistStore, VelocityStore,
+  RedisDuplicateStore, RedisVelocityStore,
+  PrismaDuplicateStore, PrismaVelocityStore 
+};
 export * from './errors.js';
 export * from './stores.js';
 export * from './security.js';
@@ -215,4 +223,25 @@ export interface VerifierOptions {
    * @returns Your custom data shape.
    */
   mapResult?: <T = any>(result: VerificationResult) => T;
+
+  /**
+   * If true, enables in-memory caching of successful verifications to avoid hitting the portal
+   * repeatedly for the same reference ID.
+   * @default false
+   * @since 2.4.0
+   */
+  enableCache?: boolean;
+}
+
+/**
+ * Health and analytics stats for the PaymentVerifier instance.
+ * @since 2.4.0
+ */
+export interface VerifierStats {
+  totalRequests: number;
+  successful: number;
+  failed: number;
+  cacheHits: number;
+  providerBreakdown: Record<string, number>;
+  uptimeMs: number;
 }

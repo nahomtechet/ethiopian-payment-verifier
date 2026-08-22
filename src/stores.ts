@@ -177,3 +177,156 @@ export class InMemoryVelocityStore implements VelocityStore {
     return record.count;
   }
 }
+
+// ── Enterprise Adapters ──────────────────────────────────────────────────────
+
+/**
+ * A duplicate store backed by Redis.
+ * Requires an external Redis client instance (e.g. `ioredis` or `redis`).
+ * @since 2.4.0
+ */
+export class RedisDuplicateStore implements DuplicateStore {
+  /**
+   * @param redisClient - An initialized Redis client (e.g., `new Redis()`).
+   * @param prefix - Key prefix to avoid collisions. Default `'epv:dup:'`.
+   * @param ttlSeconds - How long to keep the duplicate record (default 24h).
+   */
+  constructor(
+    private redisClient: any, 
+    private prefix: string = 'epv:dup:', 
+    private ttlSeconds: number = 86400
+  ) {}
+
+  async has(reference: string): Promise<boolean> {
+    const res = await this.redisClient.get(`${this.prefix}${reference}`);
+    return res !== null;
+  }
+
+  async add(reference: string): Promise<void> {
+    await this.redisClient.set(`${this.prefix}${reference}`, '1', 'EX', this.ttlSeconds);
+  }
+}
+
+/**
+ * A velocity store backed by Redis.
+ * Useful for rate limiting in a distributed serverless environment.
+ * @since 2.4.0
+ */
+export class RedisVelocityStore implements VelocityStore {
+  /**
+   * @param redisClient - An initialized Redis client.
+   * @param prefix - Key prefix to avoid collisions. Default `'epv:vel:'`.
+   * @param windowMinutes - The rolling window size in minutes.
+   */
+  constructor(
+    private redisClient: any, 
+    private prefix: string = 'epv:vel:', 
+    private windowMinutes: number = 60
+  ) {}
+
+  async incrementAndGet(identifier: string): Promise<number> {
+    const key = `${this.prefix}${identifier.toLowerCase().replace(/\s/g, '')}`;
+    const multi = this.redisClient.multi ? this.redisClient.multi() : this.redisClient;
+    
+    // Simplistic rolling window approximation using INCR + EXPIRE
+    multi.incr(key);
+    // If it's a new key, we need to set expiry. We can just set expiry on every request for simplicity,
+    // though EXPIRE overrides it. A better approach is checking TTL, but for a lightweight adapter this is fine.
+    // Or we use basic Redis INCR and if count is 1, set EXPIRE.
+    
+    // We'll execute INCR directly to get the count
+    const count = await this.redisClient.incr(key);
+    if (count === 1) {
+      await this.redisClient.expire(key, this.windowMinutes * 60);
+    }
+    return count;
+  }
+}
+
+/**
+ * A duplicate store backed by Prisma ORM.
+ * Expects a Prisma delegate that has `findUnique` and `create` methods.
+ * @since 2.4.0
+ */
+export class PrismaDuplicateStore implements DuplicateStore {
+  /**
+   * @param prismaModel - e.g., `prisma.paymentReceipt`
+   * @param referenceField - The field name storing the transaction ID (default `'reference'`).
+   */
+  constructor(
+    private prismaModel: any,
+    private referenceField: string = 'reference'
+  ) {}
+
+  async has(reference: string): Promise<boolean> {
+    const record = await this.prismaModel.findUnique({
+      where: { [this.referenceField]: reference }
+    });
+    return !!record;
+  }
+
+  async add(reference: string): Promise<void> {
+    // In many use cases, you might save the whole record yourself.
+    // This just marks it as seen if you're using EPV to strictly block duplicates pre-insertion.
+    try {
+      await this.prismaModel.create({
+        data: { [this.referenceField]: reference }
+      });
+    } catch (e: any) {
+      // Ignore unique constraint violations gracefully
+      if (e.code === 'P2002') return;
+      throw e;
+    }
+  }
+}
+
+/**
+ * A velocity store backed by Prisma ORM.
+ * Expects a Prisma delegate with `upsert` and `deleteMany` (for cleanup) or manual date logic.
+ * @since 2.4.0
+ */
+export class PrismaVelocityStore implements VelocityStore {
+  private windowMs: number;
+
+  /**
+   * @param prismaModel - e.g., `prisma.velocityLimit`
+   * @param identifierField - The field name storing the identifier (default `'identifier'`).
+   * @param windowMinutes - The rolling window size in minutes.
+   */
+  constructor(
+    private prismaModel: any,
+    private identifierField: string = 'identifier',
+    windowMinutes: number = 60
+  ) {
+    this.windowMs = windowMinutes * 60_000;
+  }
+
+  async incrementAndGet(identifier: string): Promise<number> {
+    const id = identifier.toLowerCase().replace(/\s/g, '');
+    const now = new Date();
+    const expiry = new Date(now.getTime() + this.windowMs);
+
+    // This is a naive implementation; for production Prisma usage you might use raw SQL 
+    // to do an atomic UPSERT with INCR or handle constraints explicitly.
+    try {
+      const record = await this.prismaModel.findUnique({ where: { [this.identifierField]: id } });
+      if (!record || now > record.resetAt) {
+        const newRec = await this.prismaModel.upsert({
+          where: { [this.identifierField]: id },
+          update: { count: 1, resetAt: expiry },
+          create: { [this.identifierField]: id, count: 1, resetAt: expiry }
+        });
+        return newRec.count;
+      }
+
+      const updated = await this.prismaModel.update({
+        where: { [this.identifierField]: id },
+        data: { count: { increment: 1 } }
+      });
+      return updated.count;
+    } catch (err) {
+      // Fallback if atomic operations conflict
+      return 1;
+    }
+  }
+}

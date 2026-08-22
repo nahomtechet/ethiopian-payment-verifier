@@ -22,6 +22,7 @@ import {
   VerifierOptions,
   FieldCheck,
   PaymentProvider,
+  VerifierStats,
 } from './types.js';
 import {
   ProviderNotFoundError,
@@ -36,6 +37,10 @@ import {
   InMemoryDuplicateStore,
   StaticBlacklistStore,
   InMemoryVelocityStore,
+  RedisDuplicateStore,
+  RedisVelocityStore,
+  PrismaDuplicateStore,
+  PrismaVelocityStore,
 } from './stores.js';
 import { sanitizeInput } from './sanitize.js';
 import { dispatchWebhook } from './webhook.js';
@@ -458,6 +463,16 @@ export class PaymentVerifier extends TypedEventEmitter {
   private _blacklistStore: BlacklistStore | null = null;
   private _velocityStore: VelocityStore | null = null;
   private _velocityMax: number = 0;
+  
+  private _cache = new Map<string, { result: VerificationResult, expiresAt: number }>();
+  private _stats: Omit<VerifierStats, 'uptimeMs'> = {
+    totalRequests: 0,
+    successful: 0,
+    failed: 0,
+    cacheHits: 0,
+    providerBreakdown: {}
+  };
+  private _startTime = Date.now();
 
   /**
    * Creates a new `PaymentVerifier` instance.
@@ -659,6 +674,21 @@ export class PaymentVerifier extends TypedEventEmitter {
       throw err;
     }
 
+    this._stats.totalRequests++;
+    if (!this._stats.providerBreakdown[provider]) {
+      this._stats.providerBreakdown[provider] = 0;
+    }
+    this._stats.providerBreakdown[provider]++;
+
+    // ── Check Cache ─────────────────────────────────────────────────────────
+    if (this.options.enableCache) {
+      const cached = this._cache.get(clean);
+      if (cached && Date.now() < cached.expiresAt) {
+        this._stats.cacheHits++;
+        return this.options.mapResult ? this.options.mapResult(cached.result) : cached.result;
+      }
+    }
+
     // ── S1: Duplicate guard ─────────────────────────────────────────────────
     if (this._duplicateStore) {
       // Try to extract a reference ID from input before hitting portal
@@ -718,11 +748,22 @@ export class PaymentVerifier extends TypedEventEmitter {
     }
 
     // ── S1: Record in duplicate store after successful check ────────────────
-    if (this._duplicateStore && result.status === 'SUCCESS') {
-      await Promise.resolve(this._duplicateStore.add(result.reference));
+    if (result.status === 'SUCCESS') {
+      this._stats.successful++;
+      if (this._duplicateStore) {
+        await Promise.resolve(this._duplicateStore.add(result.reference));
+      }
+      
+      // Update cache
+      if (this.options.enableCache) {
+        // Cache for 5 minutes
+        this._cache.set(result.reference, { result, expiresAt: Date.now() + 300000 });
+      }
+    } else {
+      this._stats.failed++;
     }
 
-    // ── Events & callbacks ──────────────────────────────────────────────────
+    // ── Webhook dispatch ────────────────────────────────────────────────────
     if (result.status === 'SUCCESS') {
       this.emit('verified', result);
       if (merged.onSuccess) {
