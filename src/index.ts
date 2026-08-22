@@ -27,12 +27,15 @@ import {
   ProviderNotFoundError,
   DuplicateTransactionError,
   BlacklistedSenderError,
+  VelocityLimitError,
 } from './errors.js';
 import {
   DuplicateStore,
   BlacklistStore,
+  VelocityStore,
   InMemoryDuplicateStore,
   StaticBlacklistStore,
+  InMemoryVelocityStore,
 } from './stores.js';
 import { sanitizeInput } from './sanitize.js';
 import { dispatchWebhook } from './webhook.js';
@@ -42,6 +45,7 @@ import { cleanAmount, parseDate } from './utils.js';
 export * from './types.js';
 export * from './errors.js';
 export * from './stores.js';
+export * from './security.js';
 export { BaseParser };
 export { verifyWebhookSignature } from './webhook.js';
 
@@ -452,6 +456,8 @@ export class PaymentVerifier extends TypedEventEmitter {
   private parsers: BaseParser[];
   private _duplicateStore: DuplicateStore | null = null;
   private _blacklistStore: BlacklistStore | null = null;
+  private _velocityStore: VelocityStore | null = null;
+  private _velocityMax: number = 0;
 
   /**
    * Creates a new `PaymentVerifier` instance.
@@ -474,6 +480,22 @@ export class PaymentVerifier extends TypedEventEmitter {
       this._blacklistStore = new StaticBlacklistStore(options.blacklist);
     } else if (options.blacklist && typeof options.blacklist === 'object') {
       this._blacklistStore = options.blacklist as BlacklistStore;
+    }
+
+    // Resolve velocity guard
+    if (options.velocityGuard) {
+      if ('maxPerHour' in options.velocityGuard) {
+        this._velocityStore = new InMemoryVelocityStore(60);
+        this._velocityMax = options.velocityGuard.maxPerHour;
+      } else {
+        this._velocityStore = options.velocityGuard as VelocityStore;
+        // When using a custom store, we assume the max is handled by the store or set via another means
+        // But to keep it simple, we can default to 0 and let the store manage it, 
+        // though our interface incrementAndGet just returns the count.
+        // For custom stores in this version, max must be handled externally or we should allow passing it.
+        // Let's assume a default max of 100 for custom stores if not specified.
+        this._velocityMax = 100;
+      }
     }
   }
 
@@ -507,6 +529,22 @@ export class PaymentVerifier extends TypedEventEmitter {
     this._blacklistStore = Array.isArray(entries)
       ? new StaticBlacklistStore(entries)
       : entries;
+    return this;
+  }
+
+  /**
+   * Enables velocity/rate limiting per sender.
+   * @param options - Configuration object with maxPerHour, or a custom `VelocityStore`.
+   * @returns `this` for chaining.
+   */
+  withVelocityGuard(options: { maxPerHour: number } | VelocityStore): this {
+    if ('maxPerHour' in options) {
+      this._velocityStore = new InMemoryVelocityStore(60);
+      this._velocityMax = options.maxPerHour;
+    } else {
+      this._velocityStore = options;
+      this._velocityMax = 100;
+    }
     return this;
   }
 
@@ -632,6 +670,16 @@ export class PaymentVerifier extends TypedEventEmitter {
         this.emit('failed', err);
         throw err;
       }
+
+      // Also apply velocity guard on the extracted sender before portal hit
+      if (this._velocityStore && quickParse.sender) {
+        const attempts = await Promise.resolve(this._velocityStore.incrementAndGet(quickParse.sender));
+        if (attempts > this._velocityMax) {
+          const err = new VelocityLimitError(quickParse.sender);
+          this.emit('failed', err);
+          throw err;
+        }
+      }
     }
 
     let result: VerificationResult;
@@ -649,6 +697,20 @@ export class PaymentVerifier extends TypedEventEmitter {
         if (await Promise.resolve(this._blacklistStore.isBlocked(id))) {
           const err = new BlacklistedSenderError(id);
           this.emit('blacklisted', id);
+          this.emit('failed', err);
+          throw err;
+        }
+      }
+    }
+
+    // ── S4: Velocity guard check (after online if sender wasn't in SMS) ─────
+    if (this._velocityStore && result.payer_phone) {
+      // We already checked offline sender, but if it was missing from SMS, check now
+      const quickParse = parser.parseSMS(clean);
+      if (!quickParse.sender) {
+        const attempts = await Promise.resolve(this._velocityStore.incrementAndGet(result.payer_phone));
+        if (attempts > this._velocityMax) {
+          const err = new VelocityLimitError(result.payer_phone);
           this.emit('failed', err);
           throw err;
         }

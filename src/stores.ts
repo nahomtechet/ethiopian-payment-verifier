@@ -115,3 +115,65 @@ export class StaticBlacklistStore implements BlacklistStore {
     return this.entries.some(entry => normalized.includes(entry) || entry.includes(normalized));
   }
 }
+
+/**
+ * Interface for a velocity limit store.
+ * Implement this to plug your own database (e.g., Redis) into the rate limiting system.
+ * @since 2.2.0
+ */
+export interface VelocityStore {
+  /**
+   * Records a verification attempt and returns the total count within the window.
+   * @param identifier - The phone number or account to track.
+   * @returns The number of attempts in the current time window.
+   */
+  incrementAndGet(identifier: string): number | Promise<number>;
+}
+
+/**
+ * Built-in in-memory velocity limit store.
+ * Stores attempt counts in a `Map` in RAM.
+ *
+ * ⚠️ Data is lost on process restart and time windows are not perfectly sliding.
+ * Use a custom Redis-backed `VelocityStore` for production rate limiting.
+ *
+ * @since 2.2.0
+ */
+export class InMemoryVelocityStore implements VelocityStore {
+  private counts = new Map<string, { count: number; resetAt: number }>();
+  private windowMs: number;
+
+  /**
+   * @param windowMinutes - The time window in minutes (e.g., 60 for per-hour limits).
+   */
+  constructor(windowMinutes: number = 60) {
+    this.windowMs = windowMinutes * 60_000;
+  }
+
+  /**
+   * Increments the count for the identifier and returns the new count.
+   * Resets the count if the time window has passed.
+   * @param identifier - The phone number or account to track.
+   */
+  incrementAndGet(identifier: string): number {
+    const now = Date.now();
+    const id = identifier.toLowerCase().replace(/\s/g, '');
+    let record = this.counts.get(id);
+
+    if (!record || now > record.resetAt) {
+      record = { count: 0, resetAt: now + this.windowMs };
+    }
+
+    record.count += 1;
+    this.counts.set(id, record);
+
+    // Occasional cleanup to prevent memory leaks
+    if (this.counts.size > 10000) {
+      for (const [key, val] of this.counts.entries()) {
+        if (now > val.resetAt) this.counts.delete(key);
+      }
+    }
+
+    return record.count;
+  }
+}

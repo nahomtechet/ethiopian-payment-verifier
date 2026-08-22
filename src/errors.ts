@@ -151,3 +151,25 @@ export class ExpiredReceiptError extends VerifierError {
     this.maxAgeMinutes = maxAgeMinutes;
   }
 }
+
+/**
+ * Thrown when a sender submits too many receipts in a short time window.
+ * @example
+ * try {
+ *   await verifier.verifyOnline(smsText, { velocityGuard: { maxPerHour: 5 } });
+ * } catch (err) {
+ *   if (err instanceof VelocityLimitError) {
+ *     return res.status(429).json({ error: "Too many verification attempts" });
+ *   }
+ * }
+ * @since 2.2.0
+ */
+export class VelocityLimitError extends VerifierError {
+  /** The identifier that exceeded the rate limit. */
+  readonly identifier: string;
+
+  constructor(identifier: string) {
+    super(`Rate limit exceeded for sender "${identifier}". Too many verification attempts.`);
+    this.identifier = identifier;
+  }
+}

@@ -1,10 +1,11 @@
 import { PaymentProvider, BankMetadata, CBE, Telebirr, Dashen, Awash, BOA, Zemen, BANKS } from './banks.js';
-import { DuplicateStore, BlacklistStore } from './stores.js';
+import { DuplicateStore, BlacklistStore, VelocityStore } from './stores.js';
 
 export { PaymentProvider, BankMetadata, CBE, Telebirr, Dashen, Awash, BOA, Zemen, BANKS };
-export { DuplicateStore, BlacklistStore };
+export { DuplicateStore, BlacklistStore, VelocityStore };
 export * from './errors.js';
 export * from './stores.js';
+export * from './security.js';
 
 /**
  * The result of parsing a bank SMS notification offline.
@@ -184,6 +185,14 @@ export interface VerifierOptions {
    * @since 2.0.0
    */
   blacklist?: string[] | BlacklistStore;
+
+  /**
+   * Rate limits verification attempts per sender to prevent spam/abuse.
+   * - `{ maxPerHour: 5 }`: Allows 5 attempts per hour using the built-in `InMemoryVelocityStore`.
+   * - `VelocityStore`: Your own persistent store adapter.
+   * @since 2.2.0
+   */
+  velocityGuard?: { maxPerHour: number } | VelocityStore;
 
   /**
    * Automatically dispatch verified results to a webhook URL.
