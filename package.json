@@ -1,6 +1,6 @@
 {
   "name": "ethiopian-payment-verifier",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "description": "Fast and reliable package to extract and verify payment receipts from major Ethiopian banks (CBE, Dashen, Awash, BOA, Zemen, Telebirr)",
   "repository": {
     "type": "git",
@@ -21,6 +21,11 @@
       "import": "./dist/banks.js",
       "require": "./dist/banks.js",
       "types": "./dist/banks.d.ts"
+    },
+    "./errors": {
+      "import": "./dist/errors.js",
+      "require": "./dist/errors.js",
+      "types": "./dist/errors.d.ts"
     }
   },
   "files": [

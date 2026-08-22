@@ -4,38 +4,93 @@ import { DashenParser } from './parsers/dashen.js';
 import { AwashParser } from './parsers/awash.js';
 import { BOAParser } from './parsers/boa.js';
 import { ZemenParser } from './parsers/zemen.js';
-import { ParseResult, VerificationResult, CrossCheckResult, VerifierOptions, PaymentProvider } from './types.js';
+import { BaseParser } from './parsers/base.js';
+import {
+  ParseResult,
+  VerificationResult,
+  VerificationReport,
+  CrossCheckResult,
+  VerifierOptions,
+  FieldCheck,
+  PaymentProvider,
+} from './types.js';
+import {
+  ProviderNotFoundError,
+  DuplicateTransactionError,
+  BlacklistedSenderError,
+} from './errors.js';
+import {
+  DuplicateStore,
+  BlacklistStore,
+  InMemoryDuplicateStore,
+  StaticBlacklistStore,
+} from './stores.js';
+import { sanitizeInput } from './sanitize.js';
+import { dispatchWebhook } from './webhook.js';
+import { TypedEventEmitter } from './events.js';
+import { cleanAmount, parseDate } from './utils.js';
 
 export * from './types.js';
+export * from './errors.js';
+export * from './stores.js';
+export { BaseParser };
+export { verifyWebhookSignature } from './webhook.js';
 
-import { cleanAmount, normalizeName, parseDate } from './utils.js';
+// ─── Default parser registry ────────────────────────────────────────────────
 
-const parsers = [
+const defaultParsers: BaseParser[] = [
   new CBEParser(),
   new TelebirrParser(),
   new DashenParser(),
   new AwashParser(),
   new BOAParser(),
-  new ZemenParser()
+  new ZemenParser(),
 ];
 
+// ─── Default options ─────────────────────────────────────────────────────────
+
+const DEFAULT_OPTIONS: Partial<VerifierOptions> = {
+  timeout: 10_000,
+  maxAgeMinutes: 1440,
+  userAgent: 'ethiopian-payment-verifier/2.0.0',
+};
+
+// ─── Standalone utility functions ─────────────────────────────────────────────
+
 /**
- * Detect the payment provider from an SMS string, transaction ID, or verification URL.
+ * Detects which Ethiopian payment provider an input belongs to.
+ * Works on SMS text, transaction reference IDs, and receipt URLs.
+ *
+ * @param input - Raw SMS text, transaction ID, or receipt URL.
+ * @returns The provider slug (e.g. `'cbe'`, `'telebirr'`) or `'unknown'`.
+ *
+ * @example
+ * detectProvider("FT260821ABCD"); // 'cbe'
+ * detectProvider("CHQ0FJ403O");   // 'telebirr'
  */
 export function detectProvider(input: string): PaymentProvider | 'unknown' {
-  for (const parser of parsers) {
-    if (parser.matches(input)) {
-      return parser.providerName as PaymentProvider;
-    }
+  const clean = sanitizeInput(input);
+  for (const parser of defaultParsers) {
+    if (parser.matches(clean)) return parser.providerName as PaymentProvider;
   }
   return 'unknown';
 }
 
 /**
- * Offline parse transaction information from SMS text.
+ * Parses transaction details from a bank SMS notification body using offline regex rules.
+ * No network calls are made — results are instant.
+ *
+ * @param smsText - The full SMS text body to parse.
+ * @returns Extracted transaction fields. Missing fields are `null`.
+ *
+ * @example
+ * const result = parseSMS("You received 2,500.00 ETB. Ref: CHQ0FJ403O...");
+ * console.log(result.amount);        // 2500
+ * console.log(result.transactionId); // 'CHQ0FJ403O'
  */
 export function parseSMS(smsText: string): ParseResult {
-  const provider = detectProvider(smsText);
+  const clean = sanitizeInput(smsText);
+  const provider = detectProvider(clean);
   if (provider === 'unknown') {
     return {
       provider: 'unknown',
@@ -46,245 +101,266 @@ export function parseSMS(smsText: string): ParseResult {
       receiver: null,
       date: null,
       balance: null,
-      raw: smsText
+      raw: clean,
     };
   }
-  const parser = parsers.find(p => p.providerName === provider);
-  return parser ? parser.parseSMS(smsText) : {
-    provider: 'unknown',
-    transactionId: null,
-    amount: null,
-    currency: 'ETB',
-    sender: null,
-    receiver: null,
-    date: null,
-    balance: null,
-    raw: smsText
-  };
+  const parser = defaultParsers.find(p => p.providerName === provider);
+  return parser
+    ? parser.parseSMS(clean)
+    : {
+        provider: 'unknown',
+        transactionId: null,
+        amount: null,
+        currency: 'ETB',
+        sender: null,
+        receiver: null,
+        date: null,
+        balance: null,
+        raw: clean,
+      };
 }
 
 /**
- * Online verify a transaction via URL or ID.
+ * Verifies a transaction online by fetching the official bank or wallet receipt portal.
+ *
+ * @param input - A transaction reference ID or receipt URL.
+ * @param options - Optional configuration (timeout, proxy, onSuccess, mapResult, etc.).
+ * @returns The authoritative verified result from the bank portal.
+ * @throws {ProviderNotFoundError} If the input doesn't match any known provider.
+ * @throws {OnlineVerificationError} If the portal fetch fails.
+ *
+ * @example
+ * const result = await verifyOnline("CHQ0FJ403O");
+ * console.log(result.status); // 'SUCCESS'
+ * console.log(result.amount); // 2500
  */
 export async function verifyOnline(input: string, options?: VerifierOptions): Promise<any> {
-  const provider = detectProvider(input);
-  if (provider === 'unknown') {
-    throw new Error('Could not identify payment provider from input transaction ID or URL.');
-  }
-  const parser = parsers.find(p => p.providerName === provider);
-  if (!parser) {
-    throw new Error(`Parser for provider ${provider} not found.`);
-  }
-  const result = await parser.verifyOnline(input, options);
+  const clean = sanitizeInput(input);
+  const merged = { ...DEFAULT_OPTIONS, ...options };
+  const provider = detectProvider(clean);
+  if (provider === 'unknown') throw new ProviderNotFoundError(clean);
 
-  if (result.status === 'SUCCESS' && options?.onSuccess) {
-    try {
-      await Promise.resolve(options.onSuccess(result));
-    } catch (err) {
-      console.error("onSuccess callback error:", err);
+  const parser = defaultParsers.find(p => p.providerName === provider);
+  if (!parser) throw new ProviderNotFoundError(clean);
+
+  const result = await parser.verifyOnline(clean, merged);
+
+  if (result.status === 'SUCCESS' && merged.onSuccess) {
+    try { await Promise.resolve(merged.onSuccess(result)); } catch (err) {
+      console.error('[ethiopian-payment-verifier] onSuccess error:', err);
     }
   }
 
-  if (options?.mapResult) {
-    return options.mapResult(result);
+  if (result.status === 'SUCCESS' && merged.webhook) {
+    dispatchWebhook(result, merged.webhook.url, merged.webhook.secret, merged.webhook.headers)
+      .catch(() => {});
   }
 
-  return result;
+  return merged.mapResult ? merged.mapResult(result) : result;
 }
 
 /**
- * Scan an uploaded image screenshot for receipt details and verify it.
+ * Scans a receipt image or PDF for transaction details using OCR, then verifies online.
+ *
+ * @param imageInput - A file path, URL, or `Buffer` containing the receipt image.
+ * @param options - Optional configuration.
+ * @returns The verified result.
  */
 export async function verifyImage(imageInput: string | Buffer, options?: VerifierOptions): Promise<any> {
+  const merged = { ...DEFAULT_OPTIONS, ...options };
   const { extractTextFromImage, extractReferenceFromText } = await import('./ocr.js');
   const text = await extractTextFromImage(imageInput);
   const refData = extractReferenceFromText(text);
 
-  let lookupInput = refData.url || refData.reference;
-  if (lookupInput) {
+  if (refData.url || refData.reference) {
     try {
-      return await verifyOnline(lookupInput, options);
-    } catch (err: any) {
-      // Fall back to offline parsing on network failures or bad transaction ID OCR
-    }
+      return await verifyOnline((refData.url || refData.reference)!, merged);
+    } catch {}
   }
 
-  // Fallback layout scanner for OCR text
+  // Offline OCR layout fallback
   const parsed = parseSMS(text);
-  
-  // Scraped details directly from receipt layout lines
-  let payerName = parsed.sender;
-  let receiverName = parsed.receiver;
-  let receiverAccount = null;
-  let amount = parsed.amount;
-  let date = parsed.date;
+  let payerName = parsed.sender, receiverName = parsed.receiver,
+      receiverAccount: string | null = null, amount = parsed.amount, date = parsed.date;
 
-  // Scan layout lines
-  const lines = text.split('\n')
-    .flatMap(line => line.split('  '))
-    .map(l => l.trim())
-    .filter(l => l.length > 0);
-  
+  const lines = text.split('\n').flatMap(l => l.split('  ')).map(l => l.trim()).filter(Boolean);
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    
-    // Payer Name
-    if (/Payer\s*Name/i.test(line)) {
-      const match = line.match(/Payer\s*Name\s*(?:Name)?\s*(.+)/i) || (i + 1 < lines.length ? [null, lines[i+1]] : null);
-      if (match && match[1]) {
-        payerName = match[1].replace(/[^A-Za-z\s]/g, '').trim();
-      }
+    if (/Receiver\s*Name|Beneficiary/i.test(line)) {
+      const m = line.match(/(?:Receiver\s*Name|Beneficiary)\s*[:\-]?\s*(.+)/i) ?? (i + 1 < lines.length ? [null, lines[i+1]] : null);
+      if (m?.[1]) receiverName = m[1].trim();
     }
-    
-    // Receiver Name
-    if (/Receiver\s*Name|Credited\s*Party\s*name/i.test(line)) {
-      const match = line.match(/(?:Receiver\s*Name|Credited\s*Party\s*name)\s*(.+)/i) || (i + 1 < lines.length ? [null, lines[i+1]] : null);
-      if (match && match[1]) {
-        receiverName = match[1].replace(/[^A-Za-z\s]/g, '').trim();
-      }
+    if (/Receiver\s*Account|Account\s*No/i.test(line)) {
+      const m = line.match(/(?:Receiver\s*Account|Account\s*No)\s*[:\-]?\s*(.+)/i) ?? (i + 1 < lines.length ? [null, lines[i+1]] : null);
+      if (m?.[1]) receiverAccount = m[1].replace(/[^\d*]/g, '').trim();
     }
-
-    // Receiver Account
-    if (/Receiver\s*Account|Credited\s*party\s*account/i.test(line)) {
-      const match = line.match(/(?:Receiver\s*Account|Credited\s*party\s*account\s*no)\s*(.+)/i) || (i + 1 < lines.length ? [null, lines[i+1]] : null);
-      if (match && match[1]) {
-        receiverAccount = match[1].replace(/[^\d*]/g, '').trim();
-      }
+    if (/Settled\s*Amount|Total\s*Paid|Amount/i.test(line)) {
+      const m = line.match(/(?:Settled\s*Amount|Total\s*Paid|Amount)\s*[:\-]?\s*(.+)/i) ?? (i + 1 < lines.length ? [null, lines[i+1]] : null);
+      if (m?.[1]) { const a = cleanAmount(m[1]); if (a && !amount) amount = a; }
     }
-
-    // Amount
-    if (/Settled\s*Amount|Total\s*Paid\s*Amount|Amount/i.test(line)) {
-      const match = line.match(/(?:Settled\s*Amount|Total\s*Paid\s*Amount|Amount)\s*(.+)/i) || (i + 1 < lines.length ? [null, lines[i+1]] : null);
-      if (match && match[1]) {
-        const cleanAmt = cleanAmount(match[1]);
-        if (cleanAmt && !amount) amount = cleanAmt;
-      }
-    }
-
-    // Date
-    if (/Payment\s*date|Date/i.test(line)) {
-      const match = line.match(/(?:Payment\s*date|Date)\s*(.+)/i) || (i + 1 < lines.length ? [null, lines[i+1]] : null);
-      if (match && match[1] && !date) {
-        const parsedDate = parseDate(match[1]);
-        if (parsedDate) date = parsedDate;
-      }
+    if (/Payment\s*[Dd]ate|Date/i.test(line)) {
+      const m = line.match(/(?:Payment\s*[Dd]ate|Date)\s*[:\-]?\s*(.+)/i) ?? (i + 1 < lines.length ? [null, lines[i+1]] : null);
+      if (m?.[1] && !date) { const d = parseDate(m[1]); if (d) date = d; }
     }
   }
 
-  // Additional regex check for amount in text if still null
   if (!amount) {
-    const amtMatch = text.match(/([\d,]+(?:\.\d{2})?)\s*(?:ETB|Birr)/i);
-    if (amtMatch) amount = cleanAmount(amtMatch[1]);
+    const am = text.match(/([\d,]+(?:\.\d{2})?) *(?:ETB|Birr)/i);
+    if (am) amount = cleanAmount(am[1]);
   }
 
-  const finalResult = {
-    payer_name: payerName,
-    payer_account: null,
-    receiver_name: receiverName,
-    receiver_account: receiverAccount,
-    amount: amount,
-    currency: parsed.currency || 'ETB',
-    date: date,
-    reference: parsed.transactionId || (refData.reference ?? 'OCR_TXN'),
+  const finalResult: VerificationResult = {
+    payer_name: payerName, payer_account: null,
+    receiver_name: receiverName, receiver_account: receiverAccount,
+    amount, currency: parsed.currency || 'ETB', date,
+    reference: parsed.transactionId ?? refData.reference ?? 'OCR_TXN',
     status: amount !== null ? 'SUCCESS' : 'FAILED',
-    rawDetails: { ocrText: text, parsed }
+    rawDetails: { ocrText: text, parsed },
   };
 
-  if (finalResult.status === 'SUCCESS' && options?.onSuccess) {
-    try {
-      await Promise.resolve(options.onSuccess(finalResult));
-    } catch (err) {
-      console.error("onSuccess callback error:", err);
-    }
+  if (finalResult.status === 'SUCCESS' && merged.onSuccess) {
+    try { await Promise.resolve(merged.onSuccess(finalResult)); } catch {}
+  }
+  if (finalResult.status === 'SUCCESS' && merged.webhook) {
+    dispatchWebhook(finalResult, merged.webhook.url, merged.webhook.secret, merged.webhook.headers).catch(() => {});
   }
 
-  if (options?.mapResult) {
-    return options.mapResult(finalResult);
-  }
-
-  return finalResult;
+  return merged.mapResult ? merged.mapResult(finalResult) : finalResult;
 }
 
 /**
- * Compares parsed receipt metadata against expected amount and receiver information.
+ * Validates a verified result against expected business rules.
+ * Returns a rich `VerificationReport` with a confidence score and per-field breakdown.
+ *
+ * @param result - The `VerificationResult` from `verifyOnline()`.
+ * @param expected - The business rules to check against.
+ * @returns A `VerificationReport` with `verified`, `score`, `risk`, `checks`, and `reasons`.
+ *
+ * @example
+ * const report = verifyDetails(result, { amount: 5000, maxAgeMinutes: 120 });
+ * if (!report.verified) console.log(report.reasons);
  */
 export function verifyDetails(
   result: VerificationResult,
-  expected: { amount: number; receiverAccount?: string; receiverName?: string; maxAgeMinutes?: number; strictReceiverName?: boolean }
-): { verified: boolean; reasons: string[] } {
+  expected: {
+    amount: number;
+    receiverAccount?: string;
+    receiverName?: string;
+    maxAgeMinutes?: number;
+    strictReceiverName?: boolean;
+  }
+): VerificationReport {
   const reasons: string[] = [];
+  const maxAge = expected.maxAgeMinutes ?? DEFAULT_OPTIONS.maxAgeMinutes!;
 
-  // Validate Status
-  if (result.status !== 'SUCCESS') {
-    reasons.push(`Transaction status is ${result.status} (expected SUCCESS).`);
-  }
+  // ── Status check ──────────────────────────────────────────────────────────
+  const statusCheck: FieldCheck = { passed: result.status === 'SUCCESS', received: result.status };
+  if (!statusCheck.passed) reasons.push(`Transaction status is ${result.status} (expected SUCCESS).`);
 
-  // Validate Amount
-  if (result.amount === null || result.amount < expected.amount) {
-    reasons.push(`Amount mismatch: Received ${result.amount ?? 0} ETB (expected at least ${expected.amount} ETB).`);
-  }
+  // ── Amount check ──────────────────────────────────────────────────────────
+  const amtPassed = result.amount !== null && result.amount >= expected.amount;
+  const amountCheck: FieldCheck = {
+    passed: amtPassed,
+    expected: expected.amount,
+    received: result.amount,
+  };
+  if (!amtPassed) reasons.push(`Amount mismatch: Received ${result.amount ?? 0} ETB (expected at least ${expected.amount} ETB).`);
 
-  // Validate Receiver Account (Handling masking like 1********3485)
+  // ── Receiver account check ────────────────────────────────────────────────
+  let accountPassed = true;
   if (expected.receiverAccount && result.receiver_account) {
-    const cleanExpected = expected.receiverAccount.replace(/\D/g, '');
+    const cleanExp = expected.receiverAccount.replace(/\D/g, '');
     const isMasked = result.receiver_account.includes('*');
-    
     if (isMasked) {
-      // Escape regex chars and map * to \d*
-      const regexPattern = '^' + result.receiver_account
-        .replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')
-        .replace(/\\\*/g, '\\d*')
-        + '$';
-      const regex = new RegExp(regexPattern);
-      if (!regex.test(cleanExpected)) {
+      const pattern = '^' + result.receiver_account
+        .replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')
+        .replace(/\\\*/g, '\\d*') + '$';
+      if (!new RegExp(pattern).test(cleanExp)) {
+        accountPassed = false;
         reasons.push(`Receiver account mismatch: Received ${result.receiver_account} (expected ${expected.receiverAccount}).`);
       }
     } else {
-      const cleanResult = result.receiver_account.replace(/\D/g, '');
-      if (cleanExpected !== cleanResult) {
+      if (cleanExp !== result.receiver_account.replace(/\D/g, '')) {
+        accountPassed = false;
         reasons.push(`Receiver account mismatch: Received ${result.receiver_account} (expected ${expected.receiverAccount}).`);
       }
     }
   }
+  const accountCheck: FieldCheck = {
+    passed: accountPassed,
+    expected: expected.receiverAccount,
+    received: result.receiver_account,
+  };
 
-  // Validate Receiver Name
+  // ── Receiver name check ───────────────────────────────────────────────────
+  let namePassed = true;
   if (expected.receiverName && result.receiver_name) {
     if (expected.strictReceiverName) {
-      if (expected.receiverName.trim().toLowerCase() !== result.receiver_name.trim().toLowerCase()) {
-        reasons.push(`Receiver name mismatch (strict): Received "${result.receiver_name}" (expected "${expected.receiverName}").`);
-      }
+      namePassed = expected.receiverName.trim().toLowerCase() === result.receiver_name.trim().toLowerCase();
+      if (!namePassed) reasons.push(`Receiver name mismatch (strict): Received "${result.receiver_name}" (expected "${expected.receiverName}").`);
     } else {
-      const cleanExpected = expected.receiverName.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const cleanResult = result.receiver_name.toLowerCase().replace(/[^a-z0-9]/g, '');
-      if (!cleanExpected.includes(cleanResult) && !cleanResult.includes(cleanExpected)) {
-        reasons.push(`Receiver name mismatch: Received "${result.receiver_name}" (expected "${expected.receiverName}").`);
-      }
+      const a = expected.receiverName.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const b = result.receiver_name.toLowerCase().replace(/[^a-z0-9]/g, '');
+      namePassed = a.includes(b) || b.includes(a);
+      if (!namePassed) reasons.push(`Receiver name mismatch: Received "${result.receiver_name}" (expected "${expected.receiverName}").`);
     }
   }
+  const nameCheck: FieldCheck = {
+    passed: namePassed,
+    expected: expected.receiverName,
+    received: result.receiver_name,
+  };
 
-  // Validate Transaction Age Threshold (Expiry checking)
-  if (expected.maxAgeMinutes && result.date) {
+  // ── Age / expiry check ────────────────────────────────────────────────────
+  let agePassed = true;
+  let ageMinutes: number | undefined;
+  if (result.date) {
     try {
-      const txTime = new Date(result.date).getTime();
-      const now = Date.now();
-      const diffMs = now - txTime;
-      const diffMinutes = diffMs / (1000 * 60);
-
-      if (!isNaN(txTime)) {
-        if (diffMinutes > expected.maxAgeMinutes) {
-          reasons.push(`Transaction expired: Receipt is ${Math.round(diffMinutes)} minutes old (maximum allowed age is ${expected.maxAgeMinutes} minutes).`);
-        } else if (diffMinutes < -60) {
-          reasons.push(`Transaction date is in the future: Receipt timestamp is ${result.date} (current time is ${new Date().toISOString()}).`);
+      const diffMs = Date.now() - new Date(result.date).getTime();
+      ageMinutes = diffMs / 60_000;
+      if (!isNaN(ageMinutes)) {
+        if (ageMinutes > maxAge) {
+          agePassed = false;
+          reasons.push(`Transaction expired: Receipt is ${Math.round(ageMinutes)} minutes old (maximum allowed is ${maxAge} minutes).`);
+        } else if (ageMinutes < -60) {
+          agePassed = false;
+          reasons.push(`Transaction date is in the future: ${result.date}`);
         }
       }
-    } catch {
-      // Ignore parsing errors
-    }
+    } catch {}
   }
+  const ageCheck = {
+    passed: agePassed,
+    ageMinutes,
+    maxAllowed: maxAge,
+    detail: ageMinutes !== undefined ? `${Math.round(ageMinutes)} minutes old` : undefined,
+  };
+
+  // ── Score calculation ─────────────────────────────────────────────────────
+  const weights = { status: 40, amount: 30, name: 10, account: 10, age: 10 };
+  const score =
+    (statusCheck.passed  ? weights.status  : 0) +
+    (amountCheck.passed  ? weights.amount  : 0) +
+    (nameCheck.passed    ? weights.name    : 0) +
+    (accountCheck.passed ? weights.account : 0) +
+    (ageCheck.passed     ? weights.age     : 0);
+
+  const risk: 'LOW' | 'MEDIUM' | 'HIGH' =
+    score >= 90 ? 'LOW' : score >= 60 ? 'MEDIUM' : 'HIGH';
 
   return {
     verified: reasons.length === 0,
-    reasons
+    score,
+    risk,
+    checks: {
+      status: statusCheck,
+      amount: amountCheck,
+      receiverName: nameCheck,
+      receiverAccount: accountCheck,
+      age: ageCheck,
+    },
+    reasons,
   };
 }
 
@@ -292,117 +368,340 @@ export function verifyDetails(
  * Cross-checks an offline SMS parse against the authoritative online result
  * to detect whether the SMS text has been tampered with or fabricated.
  *
- * The online result is the source of truth — anything in the SMS that
- * contradicts it is flagged as potentially tampered.
+ * @param smsResult - The offline `ParseResult` from `parseSMS()`.
+ * @param onlineResult - The authoritative `VerificationResult` from `verifyOnline()`.
+ * @returns A `CrossCheckResult` with `trusted` and a list of `tampered` field descriptions.
  *
  * @example
  * const sms = verifier.parseSMS(smsText);
  * const online = await verifier.verifyOnline(sms.transactionId!);
  * const check = verifier.crossCheck(sms, online);
- * if (!check.trusted) {
- *   console.warn('Tampered fields:', check.tampered);
- * }
+ * if (!check.trusted) console.warn('Tampered:', check.tampered);
  */
 export function crossCheck(smsResult: ParseResult, onlineResult: VerificationResult): CrossCheckResult {
   const tampered: string[] = [];
 
-  // Online must be a successful transaction first
   if (onlineResult.status !== 'SUCCESS') {
-    tampered.push(`Transaction status is ${onlineResult.status} — not a valid completed payment.`);
+    tampered.push(`Transaction status is ${onlineResult.status} — not a completed payment.`);
     return { trusted: false, tampered, onlineResult, smsResult };
   }
-
-  // Amount check — SMS claimed a different amount than what the bank recorded
   if (smsResult.amount !== null && onlineResult.amount !== null) {
-    const smsCents = Math.round(smsResult.amount * 100);
-    const onlineCents = Math.round(onlineResult.amount * 100);
-    if (smsCents !== onlineCents) {
-      tampered.push(
-        `Amount mismatch: SMS claims ${smsResult.amount} ETB but bank recorded ${onlineResult.amount} ETB.`
-      );
+    if (Math.round(smsResult.amount * 100) !== Math.round(onlineResult.amount * 100)) {
+      tampered.push(`Amount mismatch: SMS claims ${smsResult.amount} ETB but bank recorded ${onlineResult.amount} ETB.`);
     }
   }
-
-  // Receiver name check — fuzzy match
   if (smsResult.receiver && onlineResult.receiver_name) {
     const a = smsResult.receiver.toLowerCase().replace(/[^a-z0-9]/g, '');
     const b = onlineResult.receiver_name.toLowerCase().replace(/[^a-z0-9]/g, '');
     if (!a.includes(b) && !b.includes(a)) {
-      tampered.push(
-        `Receiver name mismatch: SMS says "${smsResult.receiver}" but bank recorded "${onlineResult.receiver_name}".`
-      );
+      tampered.push(`Receiver name mismatch: SMS says "${smsResult.receiver}" but bank recorded "${onlineResult.receiver_name}".`);
     }
   }
-
-  // Sender name check — fuzzy match
   if (smsResult.sender && onlineResult.payer_name) {
     const a = smsResult.sender.toLowerCase().replace(/[^a-z0-9]/g, '');
     const b = onlineResult.payer_name.toLowerCase().replace(/[^a-z0-9]/g, '');
     if (!a.includes(b) && !b.includes(a)) {
-      tampered.push(
-        `Sender name mismatch: SMS says "${smsResult.sender}" but bank recorded "${onlineResult.payer_name}".`
-      );
+      tampered.push(`Sender name mismatch: SMS says "${smsResult.sender}" but bank recorded "${onlineResult.payer_name}".`);
     }
   }
-
-  // Reference / Transaction ID check
   if (smsResult.transactionId && onlineResult.reference) {
     if (smsResult.transactionId.toUpperCase() !== onlineResult.reference.toUpperCase()) {
-      tampered.push(
-        `Transaction ID mismatch: SMS says "${smsResult.transactionId}" but bank recorded "${onlineResult.reference}".`
-      );
+      tampered.push(`Transaction ID mismatch: SMS says "${smsResult.transactionId}" but bank recorded "${onlineResult.reference}".`);
+    }
+  }
+  return { trusted: tampered.length === 0, tampered, onlineResult, smsResult };
+}
+
+// ─── PaymentVerifier Class ────────────────────────────────────────────────────
+
+/**
+ * The main unified client for verifying Ethiopian payment receipts.
+ * Extends `TypedEventEmitter` — listen to events using `.on()`.
+ *
+ * @example
+ * const verifier = new PaymentVerifier({ maxAgeMinutes: 120 })
+ *   .withDuplicateGuard()
+ *   .withBlacklist(['0911223344'])
+ *   .onSuccess((r) => db.save(r));
+ *
+ * verifier.on('verified',  (r) => console.log('Paid:', r.amount));
+ * verifier.on('duplicate', (ref) => console.warn('Duplicate:', ref));
+ *
+ * const result = await verifier.verifyOnline("CHQ0FJ403O");
+ */
+export class PaymentVerifier extends TypedEventEmitter {
+  private options: VerifierOptions;
+  private parsers: BaseParser[];
+  private _duplicateStore: DuplicateStore | null = null;
+  private _blacklistStore: BlacklistStore | null = null;
+
+  /**
+   * Creates a new `PaymentVerifier` instance.
+   * @param options - Global configuration applied to all verification calls.
+   */
+  constructor(options: VerifierOptions = {}) {
+    super();
+    this.options = { ...DEFAULT_OPTIONS, ...options };
+    this.parsers = [...defaultParsers];
+
+    // Resolve duplicate guard
+    if (options.duplicateGuard === true) {
+      this._duplicateStore = new InMemoryDuplicateStore();
+    } else if (options.duplicateGuard && typeof options.duplicateGuard === 'object') {
+      this._duplicateStore = options.duplicateGuard as DuplicateStore;
+    }
+
+    // Resolve blacklist
+    if (Array.isArray(options.blacklist)) {
+      this._blacklistStore = new StaticBlacklistStore(options.blacklist);
+    } else if (options.blacklist && typeof options.blacklist === 'object') {
+      this._blacklistStore = options.blacklist as BlacklistStore;
     }
   }
 
-  return {
-    trusted: tampered.length === 0,
-    tampered,
-    onlineResult,
-    smsResult
-  };
-}
+  // ── Fluent builder methods ─────────────────────────────────────────────────
 
-/**
- * Main unified client class for handling payment receipt extraction and verification.
- */
-export class PaymentVerifier {
-  private options: VerifierOptions;
+  /** @returns `this` for chaining. Sets the HTTP request timeout in ms. */
+  withTimeout(ms: number): this { this.options.timeout = ms; return this; }
 
-  constructor(options: VerifierOptions = {}) {
-    this.options = options;
+  /** @returns `this` for chaining. Sets an HTTP/HTTPS proxy URL. */
+  withProxy(url: string): this { this.options.proxy = url; return this; }
+
+  /** @returns `this` for chaining. Sets the maximum receipt age in minutes. */
+  withMaxAge(minutes: number): this { this.options.maxAgeMinutes = minutes; return this; }
+
+  /**
+   * Enables duplicate transaction detection.
+   * @param store - Optional custom store. Defaults to `InMemoryDuplicateStore`.
+   * @returns `this` for chaining.
+   */
+  withDuplicateGuard(store?: DuplicateStore): this {
+    this._duplicateStore = store ?? new InMemoryDuplicateStore();
+    return this;
   }
 
+  /**
+   * Enables sender/account blocklist checking.
+   * @param entries - An array of phone numbers/accounts to block, or a custom `BlacklistStore`.
+   * @returns `this` for chaining.
+   */
+  withBlacklist(entries: string[] | BlacklistStore): this {
+    this._blacklistStore = Array.isArray(entries)
+      ? new StaticBlacklistStore(entries)
+      : entries;
+    return this;
+  }
+
+  /**
+   * Configures a webhook URL to receive verified payment results.
+   * @param options - Webhook URL, optional secret, and optional extra headers.
+   * @returns `this` for chaining.
+   */
+  withWebhook(options: { url: string; secret?: string; headers?: Record<string, string> }): this {
+    this.options.webhook = options;
+    return this;
+  }
+
+  /**
+   * Registers a callback to run automatically when a transaction verifies as `SUCCESS`.
+   * @param fn - Async-safe callback receiving the `VerificationResult`.
+   * @returns `this` for chaining.
+   */
+  onSuccess(fn: (result: VerificationResult) => void | Promise<void>): this {
+    this.options.onSuccess = fn;
+    return this;
+  }
+
+  /**
+   * Registers a callback to transform the result shape before returning.
+   * @param fn - Mapping function from `VerificationResult` to your custom type.
+   * @returns `this` for chaining.
+   */
+  withMapResult<T>(fn: (result: VerificationResult) => T): this {
+    this.options.mapResult = fn as any;
+    return this;
+  }
+
+  // ── Plugin system ──────────────────────────────────────────────────────────
+
+  /**
+   * Registers a custom bank or wallet parser into this verifier instance.
+   * The new parser is checked first before built-in parsers.
+   *
+   * @param parser - An instance of a class extending `BaseParser`.
+   * @returns `this` for chaining.
+   *
+   * @example
+   * import { BaseParser } from 'ethiopian-payment-verifier';
+   * class NibParser extends BaseParser { ... }
+   * verifier.registerParser(new NibParser());
+   */
+  registerParser(parser: BaseParser): this {
+    this.parsers.unshift(parser);
+    return this;
+  }
+
+  // ── Core methods ───────────────────────────────────────────────────────────
+
+  /**
+   * Detects the payment provider from an SMS text, reference ID, or URL.
+   * @param input - Raw input to test.
+   * @returns Provider slug or `'unknown'`.
+   */
   detectProvider(input: string): PaymentProvider | 'unknown' {
-    return detectProvider(input);
+    const clean = sanitizeInput(input);
+    for (const parser of this.parsers) {
+      if (parser.matches(clean)) return parser.providerName as PaymentProvider;
+    }
+    return 'unknown';
   }
 
+  /**
+   * Parses an SMS notification body offline using regex rules.
+   * @param smsText - The full SMS text body.
+   * @returns Extracted transaction fields.
+   */
   parseSMS(smsText: string): ParseResult {
-    return parseSMS(smsText);
+    const clean = sanitizeInput(smsText);
+    const provider = this.detectProvider(clean);
+    if (provider === 'unknown') {
+      return { provider: 'unknown', transactionId: null, amount: null, currency: 'ETB', sender: null, receiver: null, date: null, balance: null, raw: clean };
+    }
+    const parser = this.parsers.find(p => p.providerName === provider);
+    return parser
+      ? parser.parseSMS(clean)
+      : { provider: 'unknown', transactionId: null, amount: null, currency: 'ETB', sender: null, receiver: null, date: null, balance: null, raw: clean };
   }
 
-  async verifyOnline(input: string, customOptions?: VerifierOptions): Promise<VerificationResult> {
-    const mergedOptions = { ...this.options, ...customOptions };
-    return verifyOnline(input, mergedOptions);
+  /**
+   * Verifies a transaction online by fetching the official bank or wallet portal.
+   * Automatically runs duplicate guard, blacklist checks, webhook dispatch, and events.
+   *
+   * @param input - Transaction reference ID or receipt URL.
+   * @param customOptions - Per-call option overrides.
+   * @returns The authoritative verification result (or your mapped type if `mapResult` is set).
+   * @throws {ProviderNotFoundError} If no provider matches.
+   * @throws {DuplicateTransactionError} If duplicate guard is enabled and ref was already used.
+   * @throws {BlacklistedSenderError} If the sender is on the blocklist.
+   * @throws {OnlineVerificationError} If the bank portal request fails.
+   */
+  async verifyOnline(input: string, customOptions?: VerifierOptions): Promise<any> {
+    const merged = { ...this.options, ...customOptions };
+    const clean = sanitizeInput(input);
+
+    const provider = this.detectProvider(clean);
+    if (provider === 'unknown') {
+      const err = new ProviderNotFoundError(clean);
+      this.emit('failed', err);
+      throw err;
+    }
+
+    const parser = this.parsers.find(p => p.providerName === provider);
+    if (!parser) {
+      const err = new ProviderNotFoundError(clean);
+      this.emit('failed', err);
+      throw err;
+    }
+
+    // ── S1: Duplicate guard ─────────────────────────────────────────────────
+    if (this._duplicateStore) {
+      // Try to extract a reference ID from input before hitting portal
+      const quickParse = parser.parseSMS(clean);
+      const candidateRef = quickParse.transactionId ?? clean;
+      if (await Promise.resolve(this._duplicateStore.has(candidateRef))) {
+        const err = new DuplicateTransactionError(candidateRef);
+        this.emit('duplicate', candidateRef);
+        this.emit('failed', err);
+        throw err;
+      }
+    }
+
+    let result: VerificationResult;
+    try {
+      result = await parser.verifyOnline(clean, merged);
+    } catch (err: any) {
+      this.emit('failed', err);
+      throw err;
+    }
+
+    // ── S2: Blacklist check (after online — we now have payer phone/account) ─
+    if (this._blacklistStore) {
+      const identifiers = [result.payer_phone, result.payer_account, result.payer_name].filter(Boolean) as string[];
+      for (const id of identifiers) {
+        if (await Promise.resolve(this._blacklistStore.isBlocked(id))) {
+          const err = new BlacklistedSenderError(id);
+          this.emit('blacklisted', id);
+          this.emit('failed', err);
+          throw err;
+        }
+      }
+    }
+
+    // ── S1: Record in duplicate store after successful check ────────────────
+    if (this._duplicateStore && result.status === 'SUCCESS') {
+      await Promise.resolve(this._duplicateStore.add(result.reference));
+    }
+
+    // ── Events & callbacks ──────────────────────────────────────────────────
+    if (result.status === 'SUCCESS') {
+      this.emit('verified', result);
+      if (merged.onSuccess) {
+        try { await Promise.resolve(merged.onSuccess(result)); } catch (e: any) {
+          console.error('[ethiopian-payment-verifier] onSuccess error:', e.message);
+        }
+      }
+      if (merged.webhook) {
+        dispatchWebhook(result, merged.webhook.url, merged.webhook.secret, merged.webhook.headers)
+          .catch(() => {});
+      }
+    }
+
+    return merged.mapResult ? merged.mapResult(result) : result;
   }
 
-  async verifyImage(imageInput: string | Buffer, customOptions?: VerifierOptions): Promise<VerificationResult> {
-    const mergedOptions = { ...this.options, ...customOptions };
-    return verifyImage(imageInput, mergedOptions);
+  /**
+   * Scans a receipt image or PDF using OCR, then verifies the extracted reference online.
+   * @param imageInput - File path, URL, or `Buffer` of the receipt image.
+   * @param customOptions - Per-call option overrides.
+   */
+  async verifyImage(imageInput: string | Buffer, customOptions?: VerifierOptions): Promise<any> {
+    const merged = { ...this.options, ...customOptions };
+    return verifyImage(imageInput, merged);
   }
 
+  /**
+   * Validates a verified result against expected business rules.
+   * Returns a rich `VerificationReport` with a 0–100 confidence score and per-field breakdown.
+   *
+   * @param result - The `VerificationResult` from `verifyOnline()`.
+   * @param expected - Business rules to validate against.
+   * @returns A `VerificationReport` — check `.verified`, `.score`, `.risk`, `.checks`, `.reasons`.
+   */
   verifyDetails(
     result: VerificationResult,
-    expected: { amount: number; receiverAccount?: string; receiverName?: string; maxAgeMinutes?: number; strictReceiverName?: boolean }
-  ): { verified: boolean; reasons: string[] } {
+    expected: {
+      amount: number;
+      receiverAccount?: string;
+      receiverName?: string;
+      maxAgeMinutes?: number;
+      strictReceiverName?: boolean;
+    }
+  ): VerificationReport {
     return verifyDetails(result, expected);
   }
 
   /**
-   * Detects SMS tampering by comparing the offline parse against the
-   * authoritative online result. Use this whenever you receive an SMS
-   * from a user and want to confirm it hasn't been edited.
+   * Cross-checks an offline SMS parse against the authoritative online result
+   * to detect whether the SMS was tampered with.
+   * Also emits the `'tampered'` event if mismatches are found.
+   *
+   * @param smsResult - The `ParseResult` from `parseSMS()`.
+   * @param onlineResult - The `VerificationResult` from `verifyOnline()`.
+   * @returns A `CrossCheckResult` with `trusted` and `tampered` field descriptions.
    */
   crossCheck(smsResult: ParseResult, onlineResult: VerificationResult): CrossCheckResult {
-    return crossCheck(smsResult, onlineResult);
+    const result = crossCheck(smsResult, onlineResult);
+    if (!result.trusted) this.emit('tampered', result);
+    return result;
   }
 }
