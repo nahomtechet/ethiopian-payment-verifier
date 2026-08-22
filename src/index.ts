@@ -4,6 +4,15 @@ import { DashenParser } from './parsers/dashen.js';
 import { AwashParser } from './parsers/awash.js';
 import { BOAParser } from './parsers/boa.js';
 import { ZemenParser } from './parsers/zemen.js';
+import { WegagenParser } from './parsers/wegagen.js';
+import { HibretParser } from './parsers/hibret.js';
+import { AmharaParser } from './parsers/amhara.js';
+import { NibParser } from './parsers/nib.js';
+import { CBOParser } from './parsers/cbo.js';
+import { MPESAParser } from './parsers/mpesa.js';
+import { HelloCashParser } from './parsers/hellocash.js';
+import { KachaParser } from './parsers/kacha.js';
+import { EbirrParser } from './parsers/ebirr.js';
 import { BaseParser } from './parsers/base.js';
 import {
   ParseResult,
@@ -45,6 +54,15 @@ const defaultParsers: BaseParser[] = [
   new AwashParser(),
   new BOAParser(),
   new ZemenParser(),
+  new WegagenParser(),
+  new HibretParser(),
+  new AmharaParser(),
+  new NibParser(),
+  new CBOParser(),
+  new MPESAParser(),
+  new HelloCashParser(),
+  new KachaParser(),
+  new EbirrParser(),
 ];
 
 // ─── Default options ─────────────────────────────────────────────────────────

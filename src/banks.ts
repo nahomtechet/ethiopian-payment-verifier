@@ -2,7 +2,7 @@ export type PaymentProvider =
   | 'cbe' | 'dbe' | 'awash' | 'dashen' | 'wegagen' | 'hibret' | 'nib' | 'boa' | 'zemen' | 'lion'
   | 'cbo' | 'oromia' | 'berhan' | 'abay' | 'bunna' | 'addis' | 'enat' | 'global' | 'zamzam' | 'hijra'
   | 'goh' | 'amhara' | 'ahadu' | 'siinqee' | 'tsehay' | 'tsedey' | 'gadaa' | 'rammis' | 'siket'
-  | 'sidama' | 'omo' | 'shabelle' | 'telebirr' | 'kacha' | 'mpesa' | 'yaya' | 'tolopay' | 'vitabirr' | 'ebirr';
+  | 'sidama' | 'omo' | 'shabelle' | 'telebirr' | 'kacha' | 'mpesa' | 'yaya' | 'tolopay' | 'vitabirr' | 'ebirr' | 'hellocash';
 
 export interface BankMetadata {
   code: PaymentProvider;
@@ -54,11 +54,12 @@ export const Yaya: BankMetadata = { code: 'yaya', name: 'Yaya Wallet', logo: 'ht
 export const Tolopay: BankMetadata = { code: 'tolopay', name: 'ToloPay', logo: 'https://paymentverifier.com/logos/tolopay.png', primaryColor: '#1565c0', isMobileMoney: true };
 export const Vitabirr: BankMetadata = { code: 'vitabirr', name: 'Vitabirr', logo: 'https://paymentverifier.com/logos/vitabirr.png', primaryColor: '#0288d1', isMobileMoney: true };
 export const Ebirr: BankMetadata = { code: 'ebirr', name: 'e-birr', logo: 'https://paymentverifier.com/logos/ebirr.png', primaryColor: '#ff6f00', isMobileMoney: true };
+export const HelloCash: BankMetadata = { code: 'hellocash', name: 'HelloCash', logo: 'https://paymentverifier.com/logos/hellocash.png', primaryColor: '#fbc02d', isMobileMoney: true };
 
 export const BANKS: Record<PaymentProvider, BankMetadata> = {
   cbe: CBE, dbe: DBE, awash: Awash, dashen: Dashen, wegagen: Wegagen, hibret: Hibret, nib: Nib, boa: BOA, zemen: Zemen, lion: Lion,
   cbo: CBO, oromia: Oromia, berhan: Berhan, abay: Abay, bunna: Bunna, addis: Addis, enat: Enat, global: Global, zamzam: ZamZam, hijra: Hijra,
   goh: Goh, amhara: Amhara, ahadu: Ahadu, siinqee: Siinqee, tsehay: Tsehay, tsedey: Tsedey, gadaa: Gadaa, rammis: Rammis, siket: Siket,
   sidama: Sidama, omo: Omo, shabelle: Shabelle,
-  telebirr: Telebirr, kacha: Kacha, mpesa: Mpesa, yaya: Yaya, tolopay: Tolopay, vitabirr: Vitabirr, ebirr: Ebirr
+  telebirr: Telebirr, kacha: Kacha, mpesa: Mpesa, yaya: Yaya, tolopay: Tolopay, vitabirr: Vitabirr, ebirr: Ebirr, hellocash: HelloCash
 };
