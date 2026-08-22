@@ -28,6 +28,21 @@ export interface VerificationResult {
   rawDetails: Record<string, any>;
 }
 
+/**
+ * Result of a cross-check between offline SMS parse and the authoritative online result.
+ * Detects if the SMS text was tampered/fabricated.
+ */
+export interface CrossCheckResult {
+  /** True only if online verification passed AND SMS data matches online data */
+  trusted: boolean;
+  /** Specific fields where the SMS data contradicts the online verified data */
+  tampered: string[];
+  /** The authoritative online result (source of truth) */
+  onlineResult: VerificationResult;
+  /** The raw offline SMS parse (potentially faked) */
+  smsResult: ParseResult;
+}
+
 export interface VerifierOptions {
   proxy?: string;
   timeout?: number;

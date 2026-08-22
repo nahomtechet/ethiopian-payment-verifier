@@ -4,7 +4,7 @@ import { DashenParser } from './parsers/dashen.js';
 import { AwashParser } from './parsers/awash.js';
 import { BOAParser } from './parsers/boa.js';
 import { ZemenParser } from './parsers/zemen.js';
-import { ParseResult, VerificationResult, VerifierOptions, PaymentProvider } from './types.js';
+import { ParseResult, VerificationResult, CrossCheckResult, VerifierOptions, PaymentProvider } from './types.js';
 
 export * from './types.js';
 
@@ -289,6 +289,80 @@ export function verifyDetails(
 }
 
 /**
+ * Cross-checks an offline SMS parse against the authoritative online result
+ * to detect whether the SMS text has been tampered with or fabricated.
+ *
+ * The online result is the source of truth — anything in the SMS that
+ * contradicts it is flagged as potentially tampered.
+ *
+ * @example
+ * const sms = verifier.parseSMS(smsText);
+ * const online = await verifier.verifyOnline(sms.transactionId!);
+ * const check = verifier.crossCheck(sms, online);
+ * if (!check.trusted) {
+ *   console.warn('Tampered fields:', check.tampered);
+ * }
+ */
+export function crossCheck(smsResult: ParseResult, onlineResult: VerificationResult): CrossCheckResult {
+  const tampered: string[] = [];
+
+  // Online must be a successful transaction first
+  if (onlineResult.status !== 'SUCCESS') {
+    tampered.push(`Transaction status is ${onlineResult.status} — not a valid completed payment.`);
+    return { trusted: false, tampered, onlineResult, smsResult };
+  }
+
+  // Amount check — SMS claimed a different amount than what the bank recorded
+  if (smsResult.amount !== null && onlineResult.amount !== null) {
+    const smsCents = Math.round(smsResult.amount * 100);
+    const onlineCents = Math.round(onlineResult.amount * 100);
+    if (smsCents !== onlineCents) {
+      tampered.push(
+        `Amount mismatch: SMS claims ${smsResult.amount} ETB but bank recorded ${onlineResult.amount} ETB.`
+      );
+    }
+  }
+
+  // Receiver name check — fuzzy match
+  if (smsResult.receiver && onlineResult.receiver_name) {
+    const a = smsResult.receiver.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const b = onlineResult.receiver_name.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (!a.includes(b) && !b.includes(a)) {
+      tampered.push(
+        `Receiver name mismatch: SMS says "${smsResult.receiver}" but bank recorded "${onlineResult.receiver_name}".`
+      );
+    }
+  }
+
+  // Sender name check — fuzzy match
+  if (smsResult.sender && onlineResult.payer_name) {
+    const a = smsResult.sender.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const b = onlineResult.payer_name.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (!a.includes(b) && !b.includes(a)) {
+      tampered.push(
+        `Sender name mismatch: SMS says "${smsResult.sender}" but bank recorded "${onlineResult.payer_name}".`
+      );
+    }
+  }
+
+  // Reference / Transaction ID check
+  if (smsResult.transactionId && onlineResult.reference) {
+    if (smsResult.transactionId.toUpperCase() !== onlineResult.reference.toUpperCase()) {
+      tampered.push(
+        `Transaction ID mismatch: SMS says "${smsResult.transactionId}" but bank recorded "${onlineResult.reference}".`
+      );
+    }
+  }
+
+  return {
+    trusted: tampered.length === 0,
+    tampered,
+    onlineResult,
+    smsResult
+  };
+}
+
+/**
  * Main unified client class for handling payment receipt extraction and verification.
  */
 export class PaymentVerifier {
@@ -321,5 +395,14 @@ export class PaymentVerifier {
     expected: { amount: number; receiverAccount?: string; receiverName?: string; maxAgeMinutes?: number; strictReceiverName?: boolean }
   ): { verified: boolean; reasons: string[] } {
     return verifyDetails(result, expected);
+  }
+
+  /**
+   * Detects SMS tampering by comparing the offline parse against the
+   * authoritative online result. Use this whenever you receive an SMS
+   * from a user and want to confirm it hasn't been edited.
+   */
+  crossCheck(smsResult: ParseResult, onlineResult: VerificationResult): CrossCheckResult {
+    return crossCheck(smsResult, onlineResult);
   }
 }
