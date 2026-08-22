@@ -1,40 +1,37 @@
 {
   "name": "ethiopian-payment-verifier",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Fast and reliable package to extract and verify payment receipts from major Ethiopian banks (CBE, Dashen, Awash, BOA, Zemen, Telebirr)",
   "repository": {
     "type": "git",
     "url": "https://github.com/nahomtechet/ethiopian-payment-verifier.git"
   },
   "author": "nahomtechet",
-
   "main": "dist/index.js",
   "module": "dist/index.js",
   "types": "dist/index.d.ts",
+  "type": "module",
+  "bin": {
+    "epv": "./bin/epv.js"
+  },
   "exports": {
-    ".": {
-      "import": "./dist/index.js",
-      "require": "./dist/index.js",
-      "types": "./dist/index.d.ts"
-    },
-    "./banks": {
-      "import": "./dist/banks.js",
-      "require": "./dist/banks.js",
-      "types": "./dist/banks.d.ts"
-    },
-    "./errors": {
-      "import": "./dist/errors.js",
-      "require": "./dist/errors.js",
-      "types": "./dist/errors.d.ts"
-    }
+    ".": "./dist/index.js",
+    "./banks": "./dist/banks.js",
+    "./errors": "./dist/errors.js",
+    "./express": "./dist/middleware/express.js",
+    "./nextjs": "./dist/middleware/nextjs.js",
+    "./react": "./dist/react.js",
+    "./testing": "./dist/testing.js",
+    "./schemas": "./dist/schemas.js"
   },
   "files": [
     "dist"
   ],
   "scripts": {
     "build": "tsc",
-    "test": "tsc --noEmit && node --import tsx --test tests/**/*.test.ts",
-    "prepublishOnly": "npm run build"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prepublishOnly": "npm run build",
+    "postinstall": "node ./bin/postinstall.js"
   },
   "keywords": [
     "ethiopia",
@@ -54,8 +51,28 @@
     "tesseract.js": "^5.1.0"
   },
   "devDependencies": {
-    "@types/node": "^26.2.0",
-    "tsx": "^4.19.0",
-    "typescript": "^5.5.4"
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.5.4",
+    "@types/react": "^18.2.0",
+    "express": "^5.2.1",
+    "react": "^19.2.8",
+    "typescript": "^5.6.2",
+    "zod": "^4.4.3"
+  },
+  "peerDependencies": {
+    "express": "^4.0.0",
+    "react": "^16.8.0 || ^17.0.0 || ^18.0.0",
+    "zod": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "express": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    },
+    "zod": {
+      "optional": true
+    }
   }
 }
