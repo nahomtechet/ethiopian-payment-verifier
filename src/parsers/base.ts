@@ -1,90 +1,245 @@
-import { ParseResult, VerificationResult, VerifierOptions } from '../types.js';
-
 /**
- * Abstract base class for all payment provider parsers.
- * Extend this class to add support for a new Ethiopian bank or wallet provider.
+ * Base parser - shared HTTP client with retries, timeout, geo-block handling.
  *
- * @example
- * import { BaseParser, ParseResult, VerificationResult } from 'ethiopian-payment-verifier';
+ * Each bank parser extends this class and implements:
+ *   - buildUrl(ref, account?, phone?) → receipt URL
+ *   - parse(data, contentType) → ParsedReceipt
  *
- * export class NibBankParser extends BaseParser {
- *   readonly providerName = 'nib';
- *
- *   matches(input: string): boolean {
- *     return /nib\s*bank|NBE[A-Z0-9]+/i.test(input);
- *   }
- *
- *   parseSMS(text: string): ParseResult {
- *     // Extract fields using regex...
- *     return { provider: 'nib' as any, transactionId: null, amount: null, ... };
- *   }
- *
- *   async verifyOnline(input: string): Promise<VerificationResult> {
- *     // Fetch and scrape the bank portal...
- *   }
- * }
- *
- * // Register with the verifier:
- * verifier.registerParser(new NibBankParser());
- *
- * @since 1.0.0
+ * The base class handles:
+ *   - HTTP fetching with configurable retries
+ *   - SSL bypass for banks with broken certs (CBE, Awash)
+ *   - Geo-block workaround (X-Forwarded-For, direct IP)
+ *   - Timeout management
  */
+import type { ParsedReceipt, HttpResult, HttpFetchOptions, Result } from "../core/types.js";
+import { ok, err } from "../core/types.js";
+
+export const MAX_RETRIES = 2;
+export const RETRY_BACKOFF_MS = 1000;
+export const DEFAULT_TIMEOUT_MS = 15000;
+export const SLOW_BANK_TIMEOUT_MS = 30000; // CBE legacy PDF endpoint is slow
+export const ETHIOPIAN_IP = "197.156.96.83";
+
+// Direct IPs for geo-blocked services
+const GEO_DIRECT_IPS: Record<string, { ip: string; host: string }> = {
+  telebirr: { ip: "196.188.116.120", host: "transactioninfo.ethiotelecom.et" },
+  mpesa: { ip: "102.218.49.92", host: "m-pesabusiness.safaricom.et" },
+};
+
+const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+
 export abstract class BaseParser {
-  /**
-   * The unique lowercase slug identifying this provider.
-   * Used by `detectProvider()` and throughout the routing logic.
-   * @example 'cbe', 'telebirr', 'nib'
-   */
-  abstract readonly providerName: string;
+  abstract readonly bankId: string;
+  abstract readonly bankName: string;
+  abstract readonly responseType: "pdf" | "html" | "json";
+  abstract readonly requiresAccount: boolean;
+  abstract readonly accountDigits?: number;
+  abstract readonly requiresPhone: boolean;
+  readonly sslVerify: boolean = true;
+  readonly geoBlocked: boolean = false;
+
+  abstract buildUrl(ref: string, account?: string, phone?: string): string;
+  abstract parse(data: string | Buffer, contentType: string): ParsedReceipt;
+  // Note: parse is sync for simple HTML/JSON parsers. CBE PDF uses static async extractPdfText.
+  // Future async parsers can override parse to be async - the verifier handles both.
 
   /**
-   * Parses transaction details offline from an SMS notification body.
-   * Must not make any network calls — extract data using regex only.
-   *
-   * @param smsText - The full SMS text body received by the customer.
-   * @returns Extracted transaction fields, with `null` for fields not found.
+   * Fetch receipt data from the bank endpoint with retries and geo-block handling.
    */
-  abstract parseSMS(smsText: string): ParseResult;
+  async fetchReceipt(
+    ref: string,
+    account?: string,
+    phone?: string,
+    options?: { fallbackUrl?: string }
+  ): Promise<Result<HttpResult>> {
+    const url = this.buildUrl(ref, account, phone);
+    const maxRetries = MAX_RETRIES;
+    // CBE legacy PDF endpoint is notoriously slow — give it more time
+    const timeoutMs = this.bankId === "cbe" ? SLOW_BANK_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const result = await this.doFetch(url, timeoutMs);
+        if (result.ok) return result;
+
+        // On last attempt, return error or fallback
+        if (attempt === maxRetries) {
+          if (this.geoBlocked && options?.fallbackUrl) {
+            return err({
+              kind: "ENDPOINT_ERROR" as const,
+              bank: this.bankName,
+              message: "Our server can't reach this bank (it blocks cloud IPs). Open the receipt directly:",
+              fallbackUrl: options.fallbackUrl,
+            });
+          }
+          return result;
+        }
+
+        // Wait before retry (exponential backoff)
+        await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS * Math.pow(2, attempt)));
+      } catch (e) {
+        if (attempt === maxRetries) {
+          if (this.geoBlocked && options?.fallbackUrl) {
+            return err({
+              kind: "ENDPOINT_ERROR" as const,
+              bank: this.bankName,
+              message: "Our server can't reach this bank (it blocks cloud IPs). Open the receipt directly:",
+              fallbackUrl: options.fallbackUrl,
+            });
+          }
+          return err({
+            kind: "ENDPOINT_ERROR" as const,
+            bank: this.bankName,
+            message: `Failed to reach ${this.bankName}: ${e instanceof Error ? e.message : String(e)}`,
+          });
+        }
+        await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS * Math.pow(2, attempt)));
+      }
+    }
+
+    return err({
+      kind: "ENDPOINT_ERROR" as const,
+      bank: this.bankName,
+      message: `Failed to reach ${this.bankName} after ${maxRetries + 1} attempts.`,
+    });
+  }
+
+  private async doFetch(url: string, timeoutMs: number = DEFAULT_TIMEOUT_MS): Promise<Result<HttpResult>> {
+    if (this.geoBlocked) {
+      return this.fetchGeoBlocked(url);
+    }
+
+    try {
+      const resp = await fetch(url, {
+        headers: { "User-Agent": BROWSER_UA },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+
+      if (resp.status === 404) {
+        return err({
+          kind: "EXTRACTION_ERROR" as const,
+          bank: this.bankName,
+          message: "Receipt not found. Check the reference number.",
+        });
+      }
+
+      if (resp.status >= 500) {
+        return err({
+          kind: "ENDPOINT_ERROR" as const,
+          bank: this.bankName,
+          message: `${this.bankName} server is currently unavailable (HTTP ${resp.status}).`,
+        });
+      }
+
+      const contentType = resp.headers.get("content-type") || "";
+      const data = this.responseType === "pdf"
+        ? Buffer.from(await resp.arrayBuffer())
+        : await resp.text();
+
+      return ok({ status: resp.status, data, contentType });
+    } catch (e) {
+      return err({
+        kind: "ENDPOINT_ERROR" as const,
+        bank: this.bankName,
+        message: `Network error: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    }
+  }
 
   /**
-   * Verifies a transaction online by fetching and scraping the provider's receipt portal.
-   *
-   * @param input - A transaction reference ID or receipt URL.
-   * @param options - Optional configuration (timeout, proxy, userAgent).
-   * @returns The authoritative verified result from the bank portal.
-   * @throws {OnlineVerificationError} If the portal fetch fails.
+   * Geo-blocked fetch: tries direct IP with X-Forwarded-For, then falls back
+   * to standard fetch with spoofed headers.
    */
-  abstract verifyOnline(input: string, options?: VerifierOptions): Promise<VerificationResult>;
+  private async fetchGeoBlocked(url: string): Promise<Result<HttpResult>> {
+    const geoInfo = GEO_DIRECT_IPS[this.bankId];
+    if (!geoInfo) {
+      // Fallback to standard fetch with X-Forwarded-For
+      try {
+        const resp = await fetch(url, {
+          headers: {
+            "User-Agent": BROWSER_UA,
+            "X-Forwarded-For": ETHIOPIAN_IP,
+            "X-Real-IP": ETHIOPIAN_IP,
+          },
+          signal: AbortSignal.timeout(8000),
+        });
+        const contentType = resp.headers.get("content-type") || "";
+        const data = await resp.text();
+        return ok({ status: resp.status, data, contentType });
+      } catch (e) {
+        return err({
+          kind: "ENDPOINT_ERROR" as const,
+          bank: this.bankName,
+          message: `Geo-blocked endpoint unreachable: ${e instanceof Error ? e.message : String(e)}`,
+          fallbackUrl: url,
+        });
+      }
+    }
 
-  /**
-   * Quick heuristic check to determine if an input (SMS text, URL, or reference ID)
-   * belongs to this provider. Should be fast and run no network calls.
-   *
-   * @param input - The raw input string to test.
-   * @returns `true` if this parser can handle the input.
-   */
-  abstract matches(input: string): boolean;
+    // Try 1: direct IP with node:https
+    try {
+      const https = await import("node:https");
+      const http = await import("node:http");
+      const directUrl = url.replace(geoInfo.host, geoInfo.ip);
+      const parsedUrl = new URL(directUrl);
+      const isHttps = parsedUrl.protocol === "https:";
+      const lib = isHttps ? https : http;
 
-  /**
-   * Helper to build a standard FAILED verification result.
-   * Use this as a default return value when scraping cannot extract data.
-   *
-   * @param reference - The transaction reference ID.
-   * @param details - Optional raw details map from the portal.
-   * @returns A `VerificationResult` with `status: 'FAILED'` and all fields set to `null`.
-   */
-  protected createUnverifiedResult(reference: string, details: Record<string, string> = {}): VerificationResult {
-    return {
-      payer_name: null,
-      payer_account: null,
-      receiver_name: null,
-      receiver_account: null,
-      amount: null,
-      currency: 'ETB',
-      date: null,
-      reference,
-      status: 'FAILED',
-      rawDetails: details
-    };
+      const responseText = await new Promise<string>((resolve, reject) => {
+        const req = lib.request(
+          {
+            hostname: parsedUrl.hostname,
+            port: parsedUrl.port || (isHttps ? 443 : 80),
+            path: parsedUrl.pathname + parsedUrl.search,
+            method: "GET",
+            headers: {
+              "User-Agent": BROWSER_UA,
+              "X-Forwarded-For": ETHIOPIAN_IP,
+              "X-Real-IP": ETHIOPIAN_IP,
+              Host: geoInfo.host,
+              Accept: "text/html,application/json,*/*",
+            },
+            rejectUnauthorized: false,
+            servername: geoInfo.host,
+          },
+          (res: { on: (event: string, cb: (chunk?: Buffer) => void) => void }) => {
+            let data = "";
+            res.on("data", (c?: Buffer) => { if (c) data += c.toString(); });
+            res.on("end", () => resolve(data));
+          }
+        );
+        req.on("error", reject);
+        req.setTimeout(8000, () => { req.destroy(); reject(new Error("timeout")); });
+        req.end();
+      });
+
+      if (responseText && responseText.length >= 10) {
+        const contentType = this.responseType === "json" ? "application/json" : "text/html";
+        return ok({ status: 200, data: responseText, contentType });
+      }
+      throw new Error("empty response");
+    } catch {
+      // Try 2: standard fetch with X-Forwarded-For
+      try {
+        const resp = await fetch(url, {
+          headers: {
+            "User-Agent": BROWSER_UA,
+            "X-Forwarded-For": ETHIOPIAN_IP,
+            "X-Real-IP": ETHIOPIAN_IP,
+          },
+          signal: AbortSignal.timeout(8000),
+        });
+        const contentType = resp.headers.get("content-type") || "";
+        const data = await resp.text();
+        return ok({ status: resp.status, data, contentType });
+      } catch (e) {
+        return err({
+          kind: "ENDPOINT_ERROR" as const,
+          bank: this.bankName,
+          message: `Geo-blocked endpoint unreachable: ${e instanceof Error ? e.message : String(e)}`,
+          fallbackUrl: url,
+        });
+      }
+    }
   }
 }

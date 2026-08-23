@@ -1,126 +1,114 @@
-import { BaseParser } from './base.js';
-import { ParseResult, VerificationResult, VerifierOptions } from '../types.js';
-import { cleanAmount, normalizeName, parseDate, request } from '../utils.js';
+/**
+ * BOA parser - Bank of Abyssinia.
+ *
+ * Endpoint: https://cs.bankofabyssinia.com/api/onlineSlip/getDetails/?id={ref}{account}
+ * Response: JSON with receipt fields
+ * Requires: reference + last 5 digits of account
+ *
+ * QR decryption:
+ *   BOA receipt QR codes are AES-256-CBC encrypted payloads. The key is hardcoded
+ *   in the BOA receipt web app (cs.bankofabyssinia.com/slip/assets/index-*.js):
+ *     password = "ELqVy2g4pGWLUIKSa+1ijwpPy6eDxBFBLBPrJ24v/IA="
+ *     salt     = "salt"
+ *     iv       = "1234567890123456"
+ *     iterations = 10000
+ *     hasher   = SHA1
+ *   Decrypted format: CSV-like string
+ *     sourceAccount,sourceName,amount,reference,date,receiverAccount,receiverName
+ */
+import { createDecipheriv, pbkdf2Sync } from "node:crypto";
+import { BaseParser } from "./base.js";
+import type { ParsedReceipt } from "../core/types.js";
+
+const QR_PASSWORD = "ELqVy2g4pGWLUIKSa+1ijwpPy6eDxBFBLBPrJ24v/IA=";
+const QR_SALT = "salt";
+const QR_IV = "1234567890123456";
+const QR_ITERATIONS = 10000;
+const QR_KEYLEN = 32;
+const QR_HASH = "sha1";
 
 export class BOAParser extends BaseParser {
-  readonly providerName = 'boa';
+  readonly bankId = "boa";
+  readonly bankName = "Bank of Abyssinia";
+  readonly responseType = "json" as const;
+  readonly requiresAccount = true;
+  readonly accountDigits = 5;
+  readonly requiresPhone = false;
 
-  matches(input: string): boolean {
-    return (
-      /abyssinia/i.test(input) || 
-      /\bboa\b/i.test(input) ||
-      /bankofabyssinia/i.test(input)
-    );
+  buildUrl(ref: string, account?: string): string {
+    const suffix = (account || "").slice(-5);
+    return `https://cs.bankofabyssinia.com/api/onlineSlip/getDetails/?id=${ref}${suffix}`;
   }
 
-  parseSMS(smsText: string): ParseResult {
-    // BOA SMS Ref can be alphanumeric starting with FT or typical TXN format
-    const refMatch = smsText.match(/ref\s*[:\-]?\s*([a-z0-9]+)/i) || smsText.match(/\b(FT[A-Z0-9]+)\b/i) || smsText.match(/\b(TXN[A-Z0-9]+)\b/i);
-    const transactionId = refMatch ? refMatch[1].toUpperCase() : null;
+  /**
+   * Decrypt a BOA receipt QR code payload and parse the embedded CSV.
+   */
+  decryptQr(qrData: string): ParsedReceipt {
+    try {
+      const ciphertext = Buffer.from(qrData, "base64");
+      const key = pbkdf2Sync(QR_PASSWORD, QR_SALT, QR_ITERATIONS, QR_KEYLEN, QR_HASH);
+      const decipher = createDecipheriv("aes-256-cbc", key, Buffer.from(QR_IV, "utf8"));
+      let plaintext = decipher.update(ciphertext, undefined, "utf8");
+      plaintext += decipher.final("utf8");
+      return this.parseQrCsv(plaintext);
+    } catch {
+      return { verified: false };
+    }
+  }
 
-    const amountMatch = smsText.match(/(?:ETB|Birr)\s*([\d,]+\.\d{2})|([\d,]+\.\d{2})\s*(?:ETB|Birr)/i);
-    const amountStr = amountMatch ? (amountMatch[1] || amountMatch[2]) : null;
-    const amount = cleanAmount(amountStr);
+  private parseQrCsv(csv: string): ParsedReceipt {
+    const parts = csv.split(",").map((s) => s.trim());
+    if (parts.length < 7) {
+      return { verified: false, raw: csv.slice(0, 500) };
+    }
 
-    const balanceMatch = smsText.match(/(?:balance|bal)\s*(?:is)?\s*[:\-]?\s*(?:ETB|Birr)?\s*([\d,]+\.\d{2})/i) || smsText.match(/(?:balance|bal)\s*(?:is)?\s*([\d,]+\.\d{2})\s*(?:ETB|Birr)?/i);
-    const balance = balanceMatch ? cleanAmount(balanceMatch[1]) : null;
-
-    const dateMatch = smsText.match(/\b\d{1,2}[/\-]\d{1,2}[/\-]\d{4}\b/) || smsText.match(/\b\d{4}-\d{2}-\d{2}\b/);
-    const date = dateMatch ? parseDate(dateMatch[0]) : null;
+    const [senderAccount, senderName, amountStr, reference, date, receiverAccount, receiverName] = parts;
+    const amount = amountStr ? parseFloat(amountStr) : NaN;
 
     return {
-      provider: 'boa',
-      transactionId,
-      amount,
-      currency: 'ETB',
-      sender: null,
-      receiver: null,
+      verified: true,
+      senderName,
+      senderAccount,
+      receiverName,
+      receiverAccount,
+      amount: Number.isFinite(amount) ? amount : undefined,
+      currency: "ETB",
       date,
-      balance,
-      raw: smsText
+      reference,
+      raw: csv.slice(0, 1000),
     };
   }
 
-  async verifyOnline(input: string, options: VerifierOptions = {}): Promise<VerificationResult> {
-    let url = '';
-    let transactionId = '';
-
-    if (input.startsWith('http://') || input.startsWith('https://')) {
-      url = input;
-      const match = input.match(/\/receipt\/([^/?#]+)/i) || input.match(/[?&]id=([^&]+)/i) || input.match(/[?&]trx=([^&]+)/i);
-      transactionId = match ? match[1] : 'URL_TXN';
-    } else {
-      transactionId = input.trim();
-      url = `https://cs.bankofabyssinia.com/slip/?trx=${transactionId}`;
-    }
-
+  parse(data: string | Buffer, _contentType: string): ParsedReceipt {
     try {
-      const res = await request(url, {
-        proxy: options.proxy,
-        timeout: options.timeout,
-        headers: {
-          'user-agent': options.userAgent || ''
-        }
-      });
-
-      if (res.status !== 200) {
-        return this.createUnverifiedResult(transactionId, { error: `Server returned status code ${res.status}` });
+      const payload = JSON.parse(data.toString());
+      const body = payload.body;
+      if (!body || !body[0] || body[0]["Payer's Name"] === "Invalid reference number") {
+        return { verified: false, raw: data.toString().slice(0, 500) };
       }
 
-      const html = res.body;
-      const details: Record<string, string> = {};
-
-      const trRegex = /<tr[^>]*>\s*<td[^>]*>([^<]+)<\/td>\s*<td[^>]*>([^<]+)<\/td>\s*<\/tr>/gi;
-      let trMatch;
-      while ((trMatch = trRegex.exec(html)) !== null) {
-        const label = trMatch[1].trim().replace(/:$/, '');
-        const val = trMatch[2].trim();
-        details[label] = val;
+      const row = body[0];
+      let amount: number | undefined;
+      const amtRaw = row["Transferred Amount"];
+      if (amtRaw) {
+        const m = amtRaw.toString().replace(/[^0-9.]/g, "");
+        if (m) amount = parseFloat(m);
       }
-
-      const cleanedHtml = html.replace(/<[^>]+>/g, '\n').replace(/\s+/g, ' ');
-      const keys = [
-        { label: /Transaction Reference|Ref|Reference/i, key: 'reference' },
-        { label: /Amount/i, key: 'amount' },
-        { label: /Payer|Sender|From/i, key: 'sender' },
-        { label: /Payee|Receiver|To/i, key: 'receiver' },
-        { label: /Date|Time/i, key: 'date' },
-        { label: /Status/i, key: 'status' }
-      ];
-
-      for (const item of keys) {
-        const regex = new RegExp(`${item.label.source}\\s*[:\-]?\\s*([^\\n\\t\\r\\s][^|\\n\\t\\r\\<]*)`, 'i');
-        const m = cleanedHtml.match(regex);
-        if (m && !details[item.key]) {
-          details[item.key] = m[1].trim();
-        }
-      }
-
-      const amountVal = cleanAmount(details['Amount'] || details['amount']);
-      const payerName = normalizeName(details['Sender Name'] || details['sender'] || details['Payer Name'] || details['Payer']);
-      const payerAccount = details['Sender Account'] || details['payer_account'] || details['Payer Account'] || null;
-      const receiverName = normalizeName(details['Receiver Name'] || details['receiver'] || details['Payee Name'] || details['Payee']);
-      const receiverAccount = details['Receiver Account'] || details['receiver_account'] || details['Payee Account'] || null;
-      const dateVal = parseDate(details['Transaction Date'] || details['Date'] || details['date']);
-      const statusStr = details['Status'] || details['status'] || '';
-
-      const isSuccess = (amountVal !== null && transactionId !== '') && 
-                        (!statusStr || /success|complete|done|successful/i.test(statusStr));
 
       return {
-        payer_name: payerName,
-        payer_account: payerAccount,
-        receiver_name: receiverName,
-        receiver_account: receiverAccount,
-        amount: amountVal,
-        currency: 'ETB',
-        date: dateVal,
-        reference: details['Transaction Reference'] || details['reference'] || transactionId,
-        status: isSuccess ? 'SUCCESS' : 'FAILED',
-        rawDetails: details
+        verified: true,
+        senderName: row["Source Account Name"],
+        senderAccount: row["Source Account"],
+        receiverName: row["Receiver's Name"],
+        receiverAccount: row["Receiver's Account"],
+        amount,
+        currency: row.currency || "ETB",
+        date: row["Transaction Date"],
+        reference: row["Transaction Reference"],
+        raw: data.toString().slice(0, 1000),
       };
-    } catch (err: any) {
-      return this.createUnverifiedResult(transactionId, { error: err.message });
+    } catch {
+      return { verified: false, raw: data.toString().slice(0, 500) };
     }
   }
 }

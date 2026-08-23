@@ -1,7 +1,7 @@
 {
   "name": "ethiopian-payment-verifier",
-  "version": "2.4.0",
-  "description": "Fast and reliable package to extract and verify payment receipts from major Ethiopian banks (CBE, Dashen, Awash, BOA, Zemen, Telebirr)",
+  "version": "1.0.0",
+  "description": "Verify Ethiopian bank and wallet receipts using their live public portals.",
   "repository": {
     "type": "git",
     "url": "https://github.com/nahomtechet/ethiopian-payment-verifier.git"
@@ -17,19 +17,16 @@
   "exports": {
     ".": "./dist/index.js",
     "./banks": "./dist/banks.js",
-    "./errors": "./dist/errors.js",
-    "./express": "./dist/middleware/express.js",
-    "./nextjs": "./dist/middleware/nextjs.js",
-    "./react": "./dist/react.js",
-    "./testing": "./dist/testing.js",
-    "./schemas": "./dist/schemas.js"
+    "./errors": "./dist/errors.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "bin"
   ],
   "scripts": {
     "build": "tsc",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test tests/**/*.test.js",
+    "pretest": "npm run build",
     "prepublishOnly": "npm run build",
     "postinstall": "node ./bin/postinstall.js"
   },
@@ -48,31 +45,12 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "tesseract.js": "^5.1.0"
+    "@clack/prompts": "^1.7.0",
+    "picocolors": "^1.1.1",
+    "unpdf": "^1.8.1"
   },
   "devDependencies": {
-    "@types/express": "^4.17.21",
     "@types/node": "^22.5.4",
-    "@types/react": "^18.2.0",
-    "express": "^5.2.1",
-    "react": "^19.2.8",
-    "typescript": "^5.6.2",
-    "zod": "^4.4.3"
-  },
-  "peerDependencies": {
-    "express": "^4.0.0",
-    "react": "^16.8.0 || ^17.0.0 || ^18.0.0",
-    "zod": "^3.0.0"
-  },
-  "peerDependenciesMeta": {
-    "express": {
-      "optional": true
-    },
-    "react": {
-      "optional": true
-    },
-    "zod": {
-      "optional": true
-    }
+    "typescript": "^5.6.2"
   }
 }

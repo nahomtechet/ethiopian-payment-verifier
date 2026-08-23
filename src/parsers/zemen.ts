@@ -1,125 +1,110 @@
-import { BaseParser } from './base.js';
-import { ParseResult, VerificationResult, VerifierOptions } from '../types.js';
-import { cleanAmount, normalizeName, parseDate, request } from '../utils.js';
+/**
+ * Zemen Bank parser.
+ *
+ * Endpoint: https://share.zemenbank.com/rt/{ref}/pdf
+ * Response: PDF with structured text
+ * Requires: only the transaction reference number (no account needed)
+ */
+import { BaseParser } from "./base.js";
+import type { ParsedReceipt } from "../core/types.js";
 
 export class ZemenParser extends BaseParser {
-  readonly providerName = 'zemen';
+  readonly bankId = "zemen";
+  readonly bankName = "Zemen Bank";
+  readonly responseType = "pdf" as const;
+  readonly requiresAccount = false;
+  readonly accountDigits?: number = undefined;
+  readonly requiresPhone = false;
 
-  matches(input: string): boolean {
-    return (
-      /zemen/i.test(input) ||
-      /share\.zemenbank\.com/i.test(input)
-    );
+  buildUrl(ref: string): string {
+    return `https://share.zemenbank.com/rt/${ref}/pdf`;
   }
 
-  parseSMS(smsText: string): ParseResult {
-    // Zemen Bank reference patterns
-    const refMatch = smsText.match(/ref\s*[:\-]?\s*([a-z0-9]+)/i) || smsText.match(/\b([A-Z0-9]{10,})\b/i);
-    const transactionId = refMatch ? refMatch[1].toUpperCase() : null;
+  parse(data: string | Buffer, _contentType: string): ParsedReceipt {
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    if (!buf.toString("ascii", 0, 4).includes("%PDF")) {
+      return { verified: false };
+    }
+    // PDF parsing is async; verifier calls extractPdfText + parseZemenPdfText separately.
+    return { verified: false };
+  }
 
-    const amountMatch = smsText.match(/(?:ETB|Birr)\s*([\d,]+\.\d{2})|([\d,]+\.\d{2})\s*(?:ETB|Birr)/i);
-    const amountStr = amountMatch ? (amountMatch[1] || amountMatch[2]) : null;
-    const amount = cleanAmount(amountStr);
+  static parsePdfText(text: string): ParsedReceipt {
+    if (!text || (!text.includes("Zemen") && !text.includes("ETTB"))) {
+      return { verified: false };
+    }
 
-    const balanceMatch = smsText.match(/(?:balance|bal)\s*(?:is)?\s*[:\-]?\s*(?:ETB|Birr)?\s*([\d,]+\.\d{2})/i) || smsText.match(/(?:balance|bal)\s*(?:is)?\s*([\d,]+\.\d{2})\s*(?:ETB|Birr)?/i);
-    const balance = balanceMatch ? cleanAmount(balanceMatch[1]) : null;
+    // Zemen PDF labels - we extract values by finding each label and slicing to the next
+    const labels = [
+      "Transaction Reference:",
+      "Transaction Date:",
+      "Transaction Amount:",
+      "Service Charge",
+      "VAT",
+      "Total Amount",
+      "Sender Name:",
+      "Sender Account:",
+      "Receiver Name:",
+      "Receiver Account:",
+      "Receiver Bank:",
+      "Narrative:",
+      "Payment Reason:",
+      "Status:",
+      "Currency:",
+    ];
 
-    const dateMatch = smsText.match(/\b\d{1,2}[/\-]\d{1,2}[/\-]\d{4}\b/) || smsText.match(/\b\d{4}-\d{2}-\d{2}\b/);
-    const date = dateMatch ? parseDate(dateMatch[0]) : null;
+    const values: Record<string, string> = {};
+    for (let i = 0; i < labels.length; i++) {
+      const label = labels[i];
+      const startIdx = text.indexOf(label);
+      if (startIdx === -1) continue;
+      const valueStart = startIdx + label.length;
+      let valueEnd = text.length;
+      for (let j = i + 1; j < labels.length; j++) {
+        const nextIdx = text.indexOf(labels[j], valueStart);
+        if (nextIdx !== -1) {
+          valueEnd = nextIdx;
+          break;
+        }
+      }
+      values[label] = text.slice(valueStart, valueEnd).trim();
+    }
+
+    // Parse amount - Zemen amounts may be prefixed with ETB or just numeric
+    let amount: number | undefined;
+    const amountRaw = values["Transaction Amount:"] || values["Total Amount"];
+    if (amountRaw) {
+      const m = amountRaw.match(/(?:ETB\s*)?([0-9,]+\.\d{2})/);
+      if (m) amount = parseFloat(m[1].replace(/,/g, ""));
+    }
 
     return {
-      provider: 'zemen',
-      transactionId,
+      verified: !!(
+        (values["Sender Name:"] || values["Receiver Name:"]) &&
+        amount &&
+        (values["Transaction Reference:"] || text.includes("ETTB"))
+      ),
+      senderName: values["Sender Name:"],
+      senderAccount: values["Sender Account:"],
+      receiverName: values["Receiver Name:"],
+      receiverAccount: values["Receiver Account:"],
       amount,
-      currency: 'ETB',
-      sender: null,
-      receiver: null,
-      date,
-      balance,
-      raw: smsText
+      currency: values["Currency:"] || "ETB",
+      date: values["Transaction Date:"],
+      reference: values["Transaction Reference:"],
+      reason: values["Narrative:"] || values["Payment Reason:"],
+      transactionStatus: values["Status:"],
     };
   }
 
-  async verifyOnline(input: string, options: VerifierOptions = {}): Promise<VerificationResult> {
-    let url = '';
-    let transactionId = '';
-
-    if (input.startsWith('http://') || input.startsWith('https://')) {
-      url = input;
-      const match = input.match(/\/rt\/([^/?#]+)/i) || input.match(/\/receipt\/([^/?#]+)/i) || input.match(/[?&]id=([^&]+)/i);
-      transactionId = match ? match[1] : 'URL_TXN';
-    } else {
-      transactionId = input.trim();
-      url = `https://share.zemenbank.com/rt/${transactionId}/pdf`;
-    }
-
+  static async extractPdfText(data: Buffer): Promise<string> {
     try {
-      const res = await request(url, {
-        proxy: options.proxy,
-        timeout: options.timeout,
-        headers: {
-          'user-agent': options.userAgent || ''
-        }
-      });
-
-      if (res.status !== 200) {
-        return this.createUnverifiedResult(transactionId, { error: `Server returned status code ${res.status}` });
-      }
-
-      const html = res.body;
-      const details: Record<string, string> = {};
-
-      const trRegex = /<tr[^>]*>\s*<td[^>]*>([^<]+)<\/td>\s*<td[^>]*>([^<]+)<\/td>\s*<\/tr>/gi;
-      let trMatch;
-      while ((trMatch = trRegex.exec(html)) !== null) {
-        const label = trMatch[1].trim().replace(/:$/, '');
-        const val = trMatch[2].trim();
-        details[label] = val;
-      }
-
-      const cleanedHtml = html.replace(/<[^>]+>/g, '\n').replace(/\s+/g, ' ');
-      const keys = [
-        { label: /Transaction Reference|Ref|Reference/i, key: 'reference' },
-        { label: /Amount/i, key: 'amount' },
-        { label: /Payer|Sender|From/i, key: 'sender' },
-        { label: /Payee|Receiver|To/i, key: 'receiver' },
-        { label: /Date|Time/i, key: 'date' },
-        { label: /Status/i, key: 'status' }
-      ];
-
-      for (const item of keys) {
-        const regex = new RegExp(`${item.label.source}\\s*[:\-]?\\s*([^\\n\\t\\r\\s][^|\\n\\t\\r\\<]*)`, 'i');
-        const m = cleanedHtml.match(regex);
-        if (m && !details[item.key]) {
-          details[item.key] = m[1].trim();
-        }
-      }
-
-      const amountVal = cleanAmount(details['Amount'] || details['amount']);
-      const payerName = normalizeName(details['Sender Name'] || details['sender'] || details['Payer Name'] || details['Payer']);
-      const payerAccount = details['Sender Account'] || details['payer_account'] || details['Payer Account'] || null;
-      const receiverName = normalizeName(details['Receiver Name'] || details['receiver'] || details['Payee Name'] || details['Payee']);
-      const receiverAccount = details['Receiver Account'] || details['receiver_account'] || details['Payee Account'] || null;
-      const dateVal = parseDate(details['Transaction Date'] || details['Date'] || details['date']);
-      const statusStr = details['Status'] || details['status'] || '';
-
-      const isSuccess = (amountVal !== null && transactionId !== '') && 
-                        (!statusStr || /success|complete|done|successful/i.test(statusStr));
-
-      return {
-        payer_name: payerName,
-        payer_account: payerAccount,
-        receiver_name: receiverName,
-        receiver_account: receiverAccount,
-        amount: amountVal,
-        currency: 'ETB',
-        date: dateVal,
-        reference: details['Transaction Reference'] || details['reference'] || transactionId,
-        status: isSuccess ? 'SUCCESS' : 'FAILED',
-        rawDetails: details
-      };
-    } catch (err: any) {
-      return this.createUnverifiedResult(transactionId, { error: err.message });
+      const { extractText, getDocumentProxy } = await import("unpdf");
+      const pdf = await getDocumentProxy(new Uint8Array(data));
+      const { text } = await extractText(pdf, { mergePages: true });
+      return text || "";
+    } catch {
+      return "";
     }
   }
 }

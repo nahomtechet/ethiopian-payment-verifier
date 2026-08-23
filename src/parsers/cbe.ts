@@ -1,186 +1,272 @@
-import { BaseParser } from './base.js';
-import { ParseResult, VerificationResult, VerifierOptions } from '../types.js';
-import { cleanAmount, normalizeName, parseDate, request } from '../utils.js';
+/**
+ * CBE parser - Commercial Bank of Ethiopia.
+ *
+ * Two systems:
+ * 1. Legacy: PDF receipt from apps.cbe.com.et:100 (requires FT ref + last 8 digits)
+ * 2. New: JSON API at Mb.cbe.com.et (receipt ID from QR code / mbreciept.cbe.com.et URLs)
+ */
+import { BaseParser } from "./base.js";
+import type { ParsedReceipt } from "../core/types.js";
 
 export class CBEParser extends BaseParser {
-  readonly providerName = 'cbe';
+  readonly bankId = "cbe";
+  readonly bankName = "Commercial Bank of Ethiopia";
+  readonly responseType = "pdf" as const;
+  readonly requiresAccount = true;
+  readonly accountDigits = 8;
+  readonly requiresPhone = false;
+  readonly sslVerify = false;
 
-  matches(input: string): boolean {
-    return (
-      /FT[A-Z0-9]{10,}/i.test(input) || 
-      /cbe\.com\.et/i.test(input) || 
-      /Commercial\s+Bank\s+of\s+Ethiopia/i.test(input) ||
-      (/CBE/i.test(input) && /Birr/i.test(input))
-    );
+  buildUrl(ref: string, account?: string): string {
+    const suffix = (account || "").slice(-8);
+    return `https://apps.cbe.com.et:100/?id=${ref}${suffix}`;
   }
 
-  parseSMS(smsText: string): ParseResult {
-    const refMatch = smsText.match(/\b(FT[A-Z0-9]+)\b/i);
-    const transactionId = refMatch ? refMatch[1].toUpperCase() : null;
+  parse(data: string | Buffer, _contentType: string): ParsedReceipt {
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    if (!buf.toString("ascii", 0, 4).includes("%PDF")) {
+      return { verified: false };
+    }
+    // PDF parsing is async (needs pdf-parse), so we return a placeholder.
+    // The verifier calls extractPdfText + parseCBEPdfText separately.
+    return { verified: false };
+  }
 
-    const amountMatch = smsText.match(/(?:ETB|Birr)\s*([\d,]+\.\d{2})|([\d,]+\.\d{2})\s*(?:ETB|Birr)/i);
-    const amountStr = amountMatch ? (amountMatch[1] || amountMatch[2]) : null;
-    const amount = cleanAmount(amountStr);
+  /**
+   * Parse CBE PDF text into a ParsedReceipt.
+   * Called by the verifier after extracting text from the PDF.
+   */
+  static parsePdfText(text: string): ParsedReceipt {
+    if (!text || !text.includes("Commercial Bank of Ethiopia")) {
+      return { verified: false };
+    }
 
-    const balanceMatch = smsText.match(/Balance\s*(?:is)?\s*(?:ETB|Birr)?\s*([\d,]+\.\d{2})/i);
-    const balanceStr = balanceMatch ? balanceMatch[1] : null;
-    const balance = cleanAmount(balanceStr);
+    // unpdf may output text with different formatting than pdf-parse.
+    // Handle both concatenated (label+value on same line) and separated formats.
+    
+    let senderName: string | undefined;
+    let receiverName: string | undefined;
+    let senderAccount: string | undefined;
+    let receiverAccount: string | undefined;
+    let amount: number | undefined;
+    let date: string | undefined;
+    let reference: string | undefined;
+    let branch: string | undefined;
+    let reason: string | undefined;
 
-    const dateMatch = smsText.match(/\b\d{1,2}[/\-]\d{1,2}[/\-]\d{4}(?:\s+\d{1,2}:\d{2}(?:\s*:\d{2})?)?\b/);
-    const date = dateMatch ? parseDate(dateMatch[0]) : null;
+    // Payer: "PayerMr Mohammed..." or "Payer\nMr Mohammed..." or "Payer Mr Mohammed..."
+    const payerMatch = text.match(/Payer\s*(?:\n+|\s+)?(Mr\s+|Mrs\s+|Ms\s+)?(.+?)(?:\n|$|Account|Receiver)/);
+    if (payerMatch) {
+      senderName = ((payerMatch[1] || "") + (payerMatch[2] || "")).trim();
+    }
+
+    // Receiver: "ReceiverSAMI ADIL ZEKARIA" or "Receiver\nSAMI..."
+    const receiverMatch = text.match(/Receiver\s*(?:\n+|\s+)?(.+?)(?:\n|$|Account|Payment)/);
+    if (receiverMatch) {
+      receiverName = receiverMatch[1].trim();
+    }
+
+    // Accounts: "Account1****1685" - find all
+    const accountMatches = text.matchAll(/Account\s*([0-9*]+)/g);
+    const accounts = Array.from(accountMatches).map((m) => m[1]);
+    if (accounts.length >= 1) senderAccount = accounts[0];
+    if (accounts.length >= 2) receiverAccount = accounts[1];
+
+    // Amount: "Transferred Amount20,000.00 ETB" or "Transferred Amount 20,000.00 ETB"
+    const amountMatch = text.match(/Transferred Amount\s*([0-9,]+\.\d{2})\s*ETB/);
+    if (amountMatch) {
+      amount = parseFloat(amountMatch[1].replace(/,/g, ""));
+    }
+
+    // Date: "Payment Date & Time5/20/2026, 7:29:00 PM" or with spaces
+    const dateMatch = text.match(
+      /Payment Date & Time\s*(\d{1,2}\/\d{1,2}\/\d{4}),?\s*(\d{1,2}:\d{2}:\d{2})\s*(AM|PM)?/
+    );
+    if (dateMatch) {
+      date = `${dateMatch[1]} ${dateMatch[2]}`;
+      if (dateMatch[3]) date += ` ${dateMatch[3]}`;
+    }
+
+    // Reference: "Reference No. (VAT Invoice No)FT26140P01YB" or with space
+    const refMatch = text.match(/Reference No\.?\s*\(VAT Invoice No\)?\s*(\S+)/);
+    if (refMatch) reference = refMatch[1];
+
+    // Branch: value appears before "Payment / Transaction Information"
+    const branchMatch = text.match(/([A-Z][A-Z ]+?)\s*\n?\s*Payment\s*\/\s*Transaction Information/);
+    if (branchMatch) branch = branchMatch[1].trim();
+
+    // Reason: "Reason / Type of service..." 
+    const reasonMatch = text.match(/Reason\s*\/\s*Type of service\s*(.+?)(?:\n|$|Transferred)/);
+    if (reasonMatch) reason = reasonMatch[1].trim();
 
     return {
-      provider: 'cbe',
-      transactionId,
+      verified: true,
+      senderName,
+      senderAccount,
+      receiverName,
+      receiverAccount,
       amount,
-      currency: 'ETB',
-      sender: null,
-      receiver: null,
+      currency: "ETB",
       date,
-      balance,
-      raw: smsText
+      reference,
+      branch,
+      reason,
     };
   }
 
-  async verifyOnline(input: string, options: VerifierOptions = {}): Promise<VerificationResult> {
-    let url = '';
-    let transactionId = '';
-    let receiptToken = '';
-
-    if (input.startsWith('http://') || input.startsWith('https://')) {
-      url = input;
-      const match = input.match(/[?&]id=([^&]+)/i) || 
-                    input.match(/\/receipt\/([^?&#]+)/i) || 
-                    input.match(/\/([^\/?#]+)(?:[?#]|$)/);
-      transactionId = match ? match[1] : 'URL_TXN';
-      receiptToken = transactionId;
-    } else {
-      transactionId = input.trim();
-      // Traditional CBE verification link format
-      url = `https://apps.cbe.com.et:100/?id=${transactionId}`;
+  static async extractPdfText(data: Buffer): Promise<string> {
+    try {
+      const { extractText, getDocumentProxy } = await import("unpdf");
+      const pdf = await getDocumentProxy(new Uint8Array(data));
+      const { text } = await extractText(pdf, { mergePages: true });
+      return text || "";
+    } catch {
+      return "";
     }
+  }
 
-    // If we have a v2 receipt token, fetch the official backend API directly
-    if (receiptToken && receiptToken.startsWith('v2-')) {
-      try {
-        const apiUrl = `https://Mb.cbe.com.et/api/v1/transactions/public/transaction-detail/${receiptToken}`;
-        const res = await request(apiUrl, {
-          proxy: options.proxy,
-          timeout: options.timeout,
-          headers: {
-            'X-App-ID': 'd1292e42-7400-49de-a2d3-9731caa4c819',
-            'X-App-Version': '0a01980b-9859-1369-8198-59f403820000',
-            'user-agent': options.userAgent || ''
-          }
-        });
-
-        if (res.status === 200) {
-          const data = JSON.parse(res.body);
-          if (data && data.id) {
-            return {
-              payer_name: normalizeName(data.debitAccountHolder),
-              payer_account: data.debitAccountNo || null,
-              receiver_name: normalizeName(data.creditAccountHolder),
-              receiver_account: data.creditAccountNo || null,
-              amount: cleanAmount(data.amountCredited || data.debitAmount),
-              currency: 'ETB',
-              date: parseDate(data.dateTimes ? data.dateTimes[0] : null),
-              reference: data.id,
-              status: data.status === 'COMPLETED' ? 'SUCCESS' : 'FAILED',
-              rawDetails: data
-            };
-          }
-        }
-      } catch (err: any) {
-        // Fall back to scraping on API failures
-      }
-    }
+  /**
+   * Override fetchReceipt for legacy CBE: the old apps.cbe.com.et:100 PDF endpoint
+   * has been decommissioned by CBE in favor of mbreciept.cbe.com.et links.
+   */
+  async fetchReceipt(
+    ref: string,
+    account?: string,
+    _phone?: string,
+    options?: { fallbackUrl?: string }
+  ) {
+    const { ok, err } = await import("../core/types.js");
+    const url = this.buildUrl(ref, account);
+    const timeoutMs = 30000;
 
     try {
-      const res = await request(url, {
-        proxy: options.proxy,
-        timeout: options.timeout,
-        headers: {
-          'user-agent': options.userAgent || ''
-        }
+      const resp = await fetch(url, {
+        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
+        signal: AbortSignal.timeout(timeoutMs),
       });
 
-      if (res.status !== 200) {
-        return this.createUnverifiedResult(transactionId, { error: `Server returned status code ${res.status}` });
+      if (resp.status === 404) {
+        return err({
+          kind: "EXTRACTION_ERROR" as const,
+          bank: this.bankName,
+          message: "Receipt not found. Check the reference number and account suffix.",
+        });
       }
 
-      const html = res.body;
-      const details: Record<string, string> = {};
-
-      // Scrape typical HTML layout (table rows <td>Label</td><td>Value</td>)
-      const trRegex = /<tr[^>]*>\s*<td[^>]*>([^<]+)<\/td>\s*<td[^>]*>([^<]+)<\/td>\s*<\/tr>/gi;
-      let trMatch;
-      while ((trMatch = trRegex.exec(html)) !== null) {
-        if (trMatch[1] && trMatch[2]) {
-          const label = trMatch[1].trim().replace(/:$/, '');
-          const val = trMatch[2].trim();
-          details[label] = val;
-        }
+      if (!resp.ok) {
+        return err({
+          kind: "ENDPOINT_ERROR" as const,
+          bank: this.bankName,
+          message: "CBE no longer supports the old FT reference format. Ask the sender for the new receipt link (mbreciept.cbe.com.et).",
+        });
       }
 
-      // If no standard tables matched, try label-value classes
-      if (Object.keys(details).length === 0) {
-        const spanRegex = /<span[^>]*class="[^"]*label[^"]*"[^>]*>([^<]+)<\/span>\s*<span[^>]*class="[^"]*value[^"]*"[^>]*>([^<]+)<\/span>/gi;
-        let spanMatch;
-        while ((spanMatch = spanRegex.exec(html)) !== null) {
-          if (spanMatch[1] && spanMatch[2]) {
-            const label = spanMatch[1].trim().replace(/:$/, '');
-            const val = spanMatch[2].trim();
-            details[label] = val;
-          }
-        }
-      }
-
-      // Fallback text parser (line-by-line scanner using keywords)
-      const cleanedHtml = html.replace(/<[^>]+>/g, '\n').replace(/\s+/g, ' ');
-      const keys = [
-        { label: /(?:Transaction Reference|Ref|Reference)/i, key: 'reference' },
-        { label: /(?:Amount|Value)/i, key: 'amount' },
-        { label: /(?:Payer|Sender|From)/i, key: 'sender' },
-        { label: /(?:Payee|Receiver|To)/i, key: 'receiver' },
-        { label: /(?:Date|Time)/i, key: 'date' },
-        { label: /(?:Status)/i, key: 'status' }
-      ];
-
-      for (const item of keys) {
-        const regex = new RegExp(`(?:${item.label.source})\\s*[:\-]?\\s*([^\\n\\t\\r\\s][^|\\n\\t\\r\\<]*)`, 'i');
-        const m = cleanedHtml.match(regex);
-        if (m && m[1] && !details[item.key]) {
-          details[item.key] = m[1].trim();
-        }
-      }
-
-      const amountVal = cleanAmount(details['Amount'] || details['amount'] || details['Value']);
-      const payerName = normalizeName(details['Payer Name'] || details['Payer'] || details['sender'] || details['From Name']);
-      const payerAccount = details['Payer Account'] || details['payer_account'] || details['Sender Account'] || null;
-      const receiverName = normalizeName(details['Payee Name'] || details['Payee'] || details['receiver'] || details['To Name']);
-      const receiverAccount = details['Payee Account'] || details['receiver_account'] || details['Receiver Account'] || null;
-      const dateVal = parseDate(details['Transaction Date'] || details['Date'] || details['date']);
-      const statusStr = details['Status'] || details['status'] || '';
-
-      const isSuccess = (amountVal !== null && transactionId !== '') && 
-                        (!statusStr || /success|complete|done|paid|successful/i.test(statusStr));
-
-      return {
-        payer_name: payerName,
-        payer_account: payerAccount,
-        receiver_name: receiverName,
-        receiver_account: receiverAccount,
-        amount: amountVal,
-        currency: 'ETB',
-        date: dateVal,
-        reference: details['Transaction Reference No'] || details['reference'] || transactionId,
-        status: isSuccess ? 'SUCCESS' : 'FAILED',
-        rawDetails: details
-      };
-    } catch (err: any) {
-      return this.createUnverifiedResult(transactionId, { error: err.message });
+      const data = Buffer.from(await resp.arrayBuffer());
+      return ok({ status: resp.status, data, contentType: "application/pdf" });
+    } catch {
+      return err({
+        kind: "ENDPOINT_ERROR" as const,
+        bank: this.bankName,
+        message: "CBE no longer supports the old FT reference format. Ask the sender for the new receipt link (mbreciept.cbe.com.et).",
+      });
     }
   }
 }
 
+export class CBENewParser extends BaseParser {
+  readonly bankId = "cbe-new";
+  readonly bankName = "Commercial Bank of Ethiopia";
+  readonly responseType = "json" as const;
+  readonly requiresAccount = false;
+  readonly accountDigits?: number = undefined;
+  readonly requiresPhone = false;
+  readonly sslVerify = false;
+
+  private static readonly API_URL = "https://Mb.cbe.com.et/api/v1/transactions/public/transaction-detail";
+  private static readonly HEADERS = {
+    "X-App-ID": "d1292e42-7400-49de-a2d3-9731caa4c819",
+    "X-App-Version": "0a01980b-9859-1369-8198-59f403820000",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
+  };
+
+  buildUrl(ref: string): string {
+    return `${CBENewParser.API_URL}/${ref}`;
+  }
+
+  parse(data: string | Buffer, _contentType: string): ParsedReceipt {
+    try {
+      const json = JSON.parse(data.toString());
+      const id = json.id as string;
+      if (!id) return { verified: false };
+
+      const debitHolder = json.debitAccountHolder as string;
+      const creditHolder = json.creditAccountHolder as string;
+      const debitAccount = json.debitAccountNo as string;
+      const creditAccount = json.creditAccountNo as string;
+      const amountStr = (json.amountCredited as string) || (json.amountDebited as string);
+      const amount = amountStr ? parseFloat(amountStr) : undefined;
+      const currency = (json.creditCurrency as string) || "ETB";
+      const dateTimes = json.dateTimes as string[];
+      const date = dateTimes?.[0] ?? undefined;
+      const paymentDetails = json.paymentDetails as string[];
+      const reason = paymentDetails?.[0] ?? undefined;
+
+      return {
+        verified: true,
+        senderName: debitHolder,
+        senderAccount: debitAccount,
+        receiverName: creditHolder,
+        receiverAccount: creditAccount,
+        amount,
+        currency,
+        date,
+        reference: id,
+        reason,
+      };
+    } catch {
+      return { verified: false };
+    }
+  }
+
+  /**
+   * Override fetchReceipt to add custom headers for CBE new API.
+   */
+  async fetchReceipt(
+    ref: string,
+    _account?: string,
+    _phone?: string,
+    _options?: { fallbackUrl?: string }
+  ) {
+    const url = this.buildUrl(ref);
+    const { ok, err } = await import("../core/types.js");
+    try {
+      const resp = await fetch(url, {
+        headers: CBENewParser.HEADERS,
+        signal: AbortSignal.timeout(10000),
+      });
+      if (resp.status === 404) {
+        return err({
+          kind: "EXTRACTION_ERROR" as const,
+          bank: this.bankName,
+          message: "Receipt not found. Check the link or reference.",
+        });
+      }
+      if (!resp.ok) {
+        return err({
+          kind: "ENDPOINT_ERROR" as const,
+          bank: this.bankName,
+          message: "CBE receipt service unavailable. Try again.",
+        });
+      }
+      const data = await resp.text();
+      return ok({ status: resp.status, data, contentType: "application/json" });
+    } catch (e) {
+      return err({
+        kind: "ENDPOINT_ERROR" as const,
+        bank: this.bankName,
+        message: `Failed to reach CBE receipt service: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    }
+  }
+}

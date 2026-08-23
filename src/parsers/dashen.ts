@@ -1,128 +1,124 @@
-import { BaseParser } from './base.js';
-import { ParseResult, VerificationResult, VerifierOptions } from '../types.js';
-import { cleanAmount, normalizeName, parseDate, request } from '../utils.js';
+/**
+ * Dashen Bank parser.
+ *
+ * Endpoint: https://receipt.dashensuperapp.com/receipt/{ref}
+ * Response: PDF with structured text
+ * Requires: only the transaction reference number (no account needed)
+ */
+import { BaseParser } from "./base.js";
+import type { ParsedReceipt } from "../core/types.js";
 
 export class DashenParser extends BaseParser {
-  readonly providerName = 'dashen';
+  readonly bankId = "dashen";
+  readonly bankName = "Dashen Bank";
+  readonly responseType = "pdf" as const;
+  readonly requiresAccount = false;
+  readonly accountDigits?: number = undefined;
+  readonly requiresPhone = false;
 
-  matches(input: string): boolean {
-    return (
-      /dashen/i.test(input) || 
-      /amole/i.test(input) || 
-      /dashensuperapp/i.test(input)
-    );
+  buildUrl(ref: string): string {
+    return `https://receipt.dashensuperapp.com/receipt/${ref}`;
   }
 
-  parseSMS(smsText: string): ParseResult {
-    // Transaction ID pattern for Dashen/Amole: alphanumeric or numeric of 8+ digits
-    const refMatch = smsText.match(/ref\s*[:\-]?\s*([a-z0-9]+)/i) || smsText.match(/\b([A-Z0-9]{8,16})\b/);
-    const transactionId = refMatch ? refMatch[1].toUpperCase() : null;
+  parse(data: string | Buffer, _contentType: string): ParsedReceipt {
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    if (!buf.toString("ascii", 0, 4).includes("%PDF")) {
+      return { verified: false };
+    }
+    // PDF parsing is async; verifier calls extractPdfText + parseDashenPdfText separately.
+    return { verified: false };
+  }
 
-    const amountMatch = smsText.match(/(?:ETB|Birr)\s*([\d,]+\.\d{2})|([\d,]+\.\d{2})\s*(?:ETB|Birr)/i);
-    const amountStr = amountMatch ? (amountMatch[1] || amountMatch[2]) : null;
-    const amount = cleanAmount(amountStr);
+  static parsePdfText(text: string): ParsedReceipt {
+    if (!text || !text.includes("Dashen Bank")) {
+      return { verified: false };
+    }
 
-    const balanceMatch = smsText.match(/(?:balance|bal|new balance)\s*(?:is)?\s*([\d,]+\.\d{2})\s*(?:ETB|Birr)/i) || smsText.match(/balance\s*(?:is)?\s*(?:ETB|Birr)?\s*([\d,]+\.\d{2})/i);
-    const balance = balanceMatch ? cleanAmount(balanceMatch[1]) : null;
+    // The Dashen PDF is extracted as one long line by unpdf. We extract values
+    // by finding the position of each known label and slicing up to the next label.
+    const labels = [
+      "Sender Name:",
+      "Sender Account Number:",
+      "Transaction Channel:",
+      "Service Type:",
+      "Narrative:",
+      "Receiver Name:",
+      "Receiver Account Number:",
+      "Instituton Name:",
+      "Transaction Reference:",
+      "Transfer Reference:",
+      "Transaction Date:",
+      "Transaction Amount",
+      "Service Charge",
+      "Excise Tax (15%):",
+      "DRRF Fee",
+      "VAT (15%):",
+      "Penalty Fee",
+      "Income Tax Fee",
+      "Tax",
+      "Interest Fee",
+      "Stamp Duty",
+      "Discount Amount",
+      "Total",
+    ];
 
-    const dateMatch = smsText.match(/\b\d{1,2}[/\-]\d{1,2}[/\-]\d{4}\b/) || smsText.match(/\b\d{4}-\d{2}-\d{2}\b/);
-    const date = dateMatch ? parseDate(dateMatch[0]) : null;
+    const values: Record<string, string> = {};
+    for (let i = 0; i < labels.length; i++) {
+      const label = labels[i];
+      const startIdx = text.indexOf(label);
+      if (startIdx === -1) continue;
+      const valueStart = startIdx + label.length;
+      let valueEnd = text.length;
+      for (let j = i + 1; j < labels.length; j++) {
+        const nextIdx = text.indexOf(labels[j], valueStart);
+        if (nextIdx !== -1) {
+          valueEnd = nextIdx;
+          break;
+        }
+      }
+      values[label] = text.slice(valueStart, valueEnd).trim();
+    }
+
+    // Amount is prefixed with "ETB" in the PDF text, e.g. "ETB 20,475.00"
+    let amount: number | undefined;
+    const amountRaw = values["Transaction Amount"];
+    if (amountRaw) {
+      const m = amountRaw.match(/ETB\s*([0-9,]+\.\d{2})/);
+      if (m) amount = parseFloat(m[1].replace(/,/g, ""));
+    }
 
     return {
-      provider: 'dashen',
-      transactionId,
+      verified: !!(
+        values["Sender Name:"] &&
+        values["Receiver Name:"] &&
+        amount &&
+        values["Transaction Reference:"]
+      ),
+      senderName: values["Sender Name:"],
+      senderAccount: values["Sender Account Number:"],
+      receiverName: values["Receiver Name:"],
+      receiverAccount: values["Receiver Account Number:"],
       amount,
-      currency: 'ETB',
-      sender: null,
-      receiver: null,
-      date,
-      balance,
-      raw: smsText
+      currency: "ETB",
+      date: (() => {
+        const raw = values["Transaction Date:"];
+        if (!raw) return undefined;
+        const m = raw.match(/[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4},?\s+\d{1,2}:\d{2}:\d{2}\s*(?:am|pm)/i);
+        return m ? m[0] : raw;
+      })(),
+      reference: values["Transaction Reference:"],
+      reason: values["Narrative:"],
     };
   }
 
-  async verifyOnline(input: string, options: VerifierOptions = {}): Promise<VerificationResult> {
-    let url = '';
-    let transactionId = '';
-
-    if (input.startsWith('http://') || input.startsWith('https://')) {
-      url = input;
-      const match = input.match(/\/receipt\/([^/?#]+)/i) || input.match(/[?&]id=([^&]+)/i);
-      transactionId = match ? match[1] : 'URL_TXN';
-    } else {
-      transactionId = input.trim();
-      url = `https://receipt.dashensuperapp.com/receipt/${transactionId}`;
-    }
-
+  static async extractPdfText(data: Buffer): Promise<string> {
     try {
-      const res = await request(url, {
-        proxy: options.proxy,
-        timeout: options.timeout,
-        headers: {
-          'user-agent': options.userAgent || ''
-        }
-      });
-
-      if (res.status !== 200) {
-        return this.createUnverifiedResult(transactionId, { error: `Server returned status code ${res.status}` });
-      }
-
-      const html = res.body;
-      const details: Record<string, string> = {};
-
-      // Match table rows or span structures
-      const trRegex = /<tr[^>]*>\s*<td[^>]*>([^<]+)<\/td>\s*<td[^>]*>([^<]+)<\/td>\s*<\/tr>/gi;
-      let trMatch;
-      while ((trMatch = trRegex.exec(html)) !== null) {
-        const label = trMatch[1].trim().replace(/:$/, '');
-        const val = trMatch[2].trim();
-        details[label] = val;
-      }
-
-      // Fallback text parser (line-by-line scanner)
-      const cleanedHtml = html.replace(/<[^>]+>/g, '\n').replace(/\s+/g, ' ');
-      const keys = [
-        { label: /Transaction Reference|Ref|Reference No/i, key: 'reference' },
-        { label: /Amount/i, key: 'amount' },
-        { label: /Payer|Sender|From/i, key: 'sender' },
-        { label: /Payee|Receiver|To/i, key: 'receiver' },
-        { label: /Date|Time/i, key: 'date' },
-        { label: /Status/i, key: 'status' }
-      ];
-
-      for (const item of keys) {
-        const regex = new RegExp(`${item.label.source}\\s*[:\-]?\\s*([^\\n\\t\\r\\s][^|\\n\\t\\r\\<]*)`, 'i');
-        const m = cleanedHtml.match(regex);
-        if (m && !details[item.key]) {
-          details[item.key] = m[1].trim();
-        }
-      }
-
-      const amountVal = cleanAmount(details['Amount'] || details['amount'] || details['Total Amount']);
-      const payerName = normalizeName(details['Sender Name'] || details['sender'] || details['Payer Name'] || details['Payer']);
-      const payerAccount = details['Sender Account'] || details['payer_account'] || details['Payer Account'] || null;
-      const receiverName = normalizeName(details['Receiver Name'] || details['receiver'] || details['Payee Name'] || details['Payee']);
-      const receiverAccount = details['Receiver Account'] || details['receiver_account'] || details['Payee Account'] || null;
-      const dateVal = parseDate(details['Transaction Date'] || details['Date'] || details['date']);
-      const statusStr = details['Status'] || details['status'] || '';
-
-      const isSuccess = (amountVal !== null && transactionId !== '') && 
-                        (!statusStr || /success|complete|done|successful/i.test(statusStr));
-
-      return {
-        payer_name: payerName,
-        payer_account: payerAccount,
-        receiver_name: receiverName,
-        receiver_account: receiverAccount,
-        amount: amountVal,
-        currency: 'ETB',
-        date: dateVal,
-        reference: details['Transaction Reference'] || details['reference'] || transactionId,
-        status: isSuccess ? 'SUCCESS' : 'FAILED',
-        rawDetails: details
-      };
-    } catch (err: any) {
-      return this.createUnverifiedResult(transactionId, { error: err.message });
+      const { extractText, getDocumentProxy } = await import("unpdf");
+      const pdf = await getDocumentProxy(new Uint8Array(data));
+      const { text } = await extractText(pdf, { mergePages: true });
+      return text || "";
+    } catch {
+      return "";
     }
   }
 }

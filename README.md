@@ -1,303 +1,160 @@
 # Ethiopian Payment Verifier
 
-> Fast, reliable TypeScript library to parse and verify digital payment receipts and SMS alerts from major Ethiopian banks and mobile money providers.
+> Fast, reliable TypeScript library to parse and verify digital payment receipts from major Ethiopian banks and mobile money providers.
 
 [![npm version](https://img.shields.io/npm/v/ethiopian-payment-verifier)](https://www.npmjs.com/package/ethiopian-payment-verifier)
 [![license](https://img.shields.io/npm/l/ethiopian-payment-verifier)](LICENSE)
-[![types](https://img.shields.io/npm/types/ethiopian-payment-verifier)](https://www.npmjs.com/package/ethiopian-payment-verifier)
+
+`ethiopian-payment-verifier` is a framework-agnostic Node.js library and CLI tool that verifies digital payment receipts by querying the public endpoints of Ethiopian financial institutions. It takes a transaction reference (or URL), detects the bank, and returns structured JSON detailing the transaction amount, date, and recipient.
+
+## 🚀 Features
+
+- **No API Keys Required:** Validates receipts directly against the banks' public receipt verification endpoints.
+- **Auto-Detect Bank:** Give it a URL or reference, and it automatically detects the corresponding bank.
+- **Universal CLI:** Verify receipts instantly from your terminal (`epv verify`).
+- **Framework Agnostic:** Pure Node.js. Works seamlessly in Express, Next.js, Nuxt, or any other Node environment.
+- **Type-Safe:** Written in TypeScript with strict schemas.
 
 ---
 
-## Supported Providers
+## 🏦 Supported Providers
 
 ### Banks
-`cbe` · `dashen` · `awash` · `boa` · `zemen`
+`cbe` (Commercial Bank of Ethiopia) · `dashen` (Dashen Bank) · `awash` (Awash Bank) · `boa` (Bank of Abyssinia) · `zemen` (Zemen Bank)
 
 ### Mobile Money
-`telebirr`
+`telebirr` · `mpesa` · `cbebirr` · `ebirr`
 
 ---
 
-## Installation
+## 📦 Installation
 
 ```bash
 npm install ethiopian-payment-verifier
-# or
-yarn add ethiopian-payment-verifier
 ```
 
 ---
 
-## Quick Start
+## 💻 Usage (Node.js)
+
+The core engine revolves around the `Verifier` class.
+
+### 1. Simple Verification
+
+If you know the bank and the transaction reference:
 
 ```typescript
-import { PaymentVerifier } from 'ethiopian-payment-verifier';
+import { Verifier } from "ethiopian-payment-verifier";
 
-const verifier = new PaymentVerifier();
+async function verify() {
+  const verifier = new Verifier();
+  
+  // Verify a CBE receipt
+  const result = await verifier.verify({
+    bank: "cbe",
+    reference: "FT240101QW8X"
+  });
 
-// 1. Parse an incoming SMS alert (Offline, instant)
-const sms = "You have received 2,500.00 ETB from 0911223344. Ref: CHQ0FJ403O on 2026-08-21.";
-const parsed = verifier.parseSMS(sms);
-console.log(parsed.amount);       // 2500
-console.log(parsed.transactionId); // 'CHQ0FJ403O'
-
-// 2. Verify a receipt URL/ID online (fetches the bank portal)
-const result = await verifier.verifyOnline("https://transactioninfo.ethiotelecom.et/receipt/CHQ0FJ403O");
-console.log(result.status);       // 'SUCCESS'
-console.log(result.amount);       // 2500
-console.log(result.payer_name);   // 'Abebe Kebede'
-
-// 3. Validate the result against expected values
-const check = verifier.verifyDetails(result, {
-  amount: 2500,
-  receiverName: "Remedan Wako",
-  maxAgeMinutes: 120
-});
-console.log(check.verified); // true
-console.log(check.reasons);  // []
-```
-
----
-
-## API Reference
-
-### `new PaymentVerifier(options?)`
-
-Creates a verifier instance with optional global configuration.
-
-```typescript
-const verifier = new PaymentVerifier({
-  timeout: 8000,
-  proxy: 'http://196.189.x.x:8080',
-  userAgent: 'MyApp/1.0',
-  maxAgeMinutes: 60,
-  onSuccess: async (result) => {
-    await db.payment.create({ data: { txnId: result.reference, amount: result.amount } });
-  },
-  mapResult: (result) => ({
-    reference: result.reference,
-    settled: result.amount,
-    paidBy: result.payer_name,
-  }),
-});
-```
-
----
-
-### `verifier.detectProvider(input)`
-
-Detects which Ethiopian provider a transaction ID, URL, or SMS belongs to.
-
-```typescript
-verifier.detectProvider("FT260821ABCD");   // 'cbe'
-verifier.detectProvider("CHQ0FJ403O");     // 'telebirr'
-verifier.detectProvider("hello world");    // 'unknown'
-```
-
-**Returns**: `'cbe' | 'telebirr' | 'dashen' | 'awash' | 'boa' | 'zemen' | 'unknown'`
-
----
-
-### `verifier.parseSMS(smsText)`
-
-Parses the full text of a bank SMS notification offline using regex rules.
-
-```typescript
-const result = verifier.parseSMS("Your account has been credited with 1000 ETB. Ref: FT260821ABCD...");
-```
-
-**Returns: `ParseResult`**
-```typescript
-interface ParseResult {
-  provider: string;        // 'cbe', 'telebirr', etc.
-  transactionId: string | null;
-  amount: number | null;
-  currency: string;        // 'ETB'
-  sender: string | null;
-  receiver: string | null;
-  date: string | null;     // ISO 8601 string
-  balance: number | null;
-  raw: string;
-}
-```
-
----
-
-### `verifier.verifyOnline(input, options?)`
-
-Fetches and scrapes the official bank/wallet receipt portal to verify a transaction.
-
-```typescript
-const result = await verifier.verifyOnline("CHQ0FJ403O");
-const result = await verifier.verifyOnline("https://transactioninfo.ethiotelecom.et/receipt/CHQ0FJ403O");
-```
-
-**Returns: `VerificationResult`**
-```typescript
-interface VerificationResult {
-  payer_name: string | null;
-  payer_account: string | null;
-  receiver_name: string | null;
-  receiver_account: string | null;
-  amount: number | null;
-  currency: string;
-  date: string | null;     // ISO 8601 string
-  reference: string;
-  status: 'SUCCESS' | 'FAILED' | 'PENDING';
-  rawDetails: Record<string, any>;
-}
-```
-
-> **Note**: Ethiopian bank portals are geofenced. See [Proxy Configuration](#proxy-configuration) if you're running outside Ethiopia.
-
----
-
-### `verifier.verifyDetails(result, expected)`
-
-Validates the verified result against your expected business rules. Returns a structured report.
-
-```typescript
-const check = verifier.verifyDetails(result, {
-  amount: 5000,
-  receiverAccount: "0912345678",
-  receiverName: "Abebe Kebede",
-  maxAgeMinutes: 120,       // Reject receipts older than 2 hours
-  strictReceiverName: false  // false = fuzzy match (default), true = exact match
-});
-
-if (!check.verified) {
-  console.log("Validation failed:", check.reasons);
-  // e.g. ["Amount mismatch: Received 4500 ETB (expected at least 5000 ETB)."]
-}
-```
-
-| Parameter | Type | Description |
-|---|---|---|
-| `amount` | `number` | Minimum expected transaction amount in ETB |
-| `receiverAccount` | `string?` | Expected receiver phone/account number (supports masked format like `2519****7133`) |
-| `receiverName` | `string?` | Expected name of the payment receiver |
-| `maxAgeMinutes` | `number?` | Maximum allowed receipt age in minutes (e.g. `120` = 2 hours) |
-| `strictReceiverName` | `boolean?` | `true` = exact match, `false` = fuzzy partial match (default) |
-
-**Returns**:
-```typescript
-{ verified: boolean; reasons: string[] }
-```
-
----
-
-## Options Reference (`VerifierOptions`)
-
-All options can be passed to the constructor (applied globally) or to individual method calls (per-request override).
-
-| Option | Type | Description |
-|---|---|---|
-| `timeout` | `number` | HTTP request timeout in milliseconds (default: no limit) |
-| `proxy` | `string` | HTTP/HTTPS proxy URL, e.g. `http://user:pass@host:port` |
-| `userAgent` | `string` | Custom `User-Agent` header string for scraper requests |
-| `maxAgeMinutes` | `number` | Passed as default to `verifyDetails` — reject old receipts globally |
-| `onSuccess` | `(result) => void \| Promise<void>` | Async callback fired automatically when a transaction verifies as `SUCCESS` |
-| `mapResult` | `(result) => T` | Transform the raw `VerificationResult` into any custom shape before returning |
-
-### `onSuccess` — Auto-Save Verified Payments
-
-```typescript
-const verifier = new PaymentVerifier({
-  onSuccess: async (result) => {
-    // This fires automatically when status === 'SUCCESS'
-    await saveToDatabase({
-      reference: result.reference,
-      amount: result.amount,
-      payer: result.payer_name,
-      date: result.date,
-    });
+  if (result.ok) {
+    console.log("Success! Paid amount:", result.data.amount);
+    console.log("Date:", result.data.date);
+    console.log("Payer:", result.data.payerName);
+  } else {
+    console.error("Verification failed:", result.error.message);
   }
-});
-```
-
-### `mapResult` — Custom Return Shape
-
-```typescript
-const verifier = new PaymentVerifier({
-  mapResult: (result) => ({
-    txnId: result.reference,
-    settled: result.amount,
-    currency: result.currency,
-    paidBy: result.payer_name,
-    receivedBy: result.receiver_name,
-    success: result.status === 'SUCCESS',
-  })
-});
-
-const data = await verifier.verifyOnline("CHQ0FJ403O");
-// data is now your custom shape, not VerificationResult
-```
-
----
-
-## Bank & Provider Registry
-
-Import bank/wallet metadata (name, colors, logos) for use in UI components — browser-safe, no server required.
-
-```typescript
-import { BANKS, WALLETS, ALL_PROVIDERS, getBankBySlug } from 'ethiopian-payment-verifier/banks';
-
-// All 32 banks
-console.log(BANKS.length); // 32
-
-// All 7 mobile wallets
-console.log(WALLETS.length); // 7
-
-// Lookup by provider slug
-const cbe = getBankBySlug('cbe');
-console.log(cbe.name);    // 'Commercial Bank of Ethiopia'
-console.log(cbe.color);   // '#007A3D'
-console.log(cbe.logoUrl); // URL to official logo
-```
-
-Each entry follows this shape:
-```typescript
-interface BankMeta {
-  slug: string;
-  name: string;
-  shortName?: string;
-  color: string;    // Primary brand hex color
-  logoUrl: string;  // Public image URL
 }
 ```
 
----
+### 2. Auto-Detecting from URL
 
-## Standalone Functions
-
-For lightweight integrations, import individual functions directly without instantiating a class:
+Many banks generate a public URL for receipts. The verifier can extract the reference and the bank automatically:
 
 ```typescript
-import { parseSMS, verifyOnline, detectProvider, verifyDetails } from 'ethiopian-payment-verifier';
+import { Verifier } from "ethiopian-payment-verifier";
 
-const provider = detectProvider("FT260821ABCD");  // 'cbe'
-
-const parsed = parseSMS("Dear Customer, your account was credited...");
-
-const result = await verifyOnline("CHQ0FJ403O", { timeout: 5000 });
-
-const check = verifyDetails(result, { amount: 1000, maxAgeMinutes: 60 });
+async function checkUrl(receiptUrl: string) {
+  const verifier = new Verifier();
+  
+  const result = await verifier.verifyUrl(receiptUrl);
+  
+  if (result.ok) {
+    console.log(`Verified ${result.data.bank} transaction:`, result.data.amount);
+  }
+}
 ```
 
----
+### 3. Extra Security (Account Matching)
 
-## Proxy Configuration
-
-Ethiopian bank portals are geofenced — requests from cloud providers (AWS, Vercel, Render, etc.) outside Ethiopia will be blocked.
+Some banks don't return the payee name, or you may want to ensure the money was deposited into *your* specific account. You can pass your account number to enforce a match:
 
 ```typescript
-const verifier = new PaymentVerifier({
-  proxy: 'http://196.189.x.x:8080'  // An Ethiopian IP proxy
+const result = await verifier.verify({
+  bank: "boa",
+  reference: "12345678",
+  accountNumber: "1000123456789" // Will fail if the receipt went to a different account
 });
 ```
 
 ---
+
+## ⚡ CLI Usage
+
+The package comes with a built-in terminal CLI called `epv` (Ethiopian Payment Verifier). You can use it directly via `npx` or by installing it globally.
+
+### Verify a transaction
+
+```bash
+# Basic verification
+npx epv verify cbe FT240101QW8X
+
+# Verify and enforce that it was sent to a specific account
+npx epv verify boa 12345678 -a 1000123456789
+
+# Verify using a full URL
+npx epv verify https://apps.cbe.com.et:100/?id=FT240101QW8X
+```
+
+### Check system health
+
+Sometimes bank endpoints go down. You can check the status of all supported endpoints:
+
+```bash
+npx epv health
+```
+
+### List supported endpoints
+
+```bash
+npx epv info
+```
+
+---
+
+## 🛠 Advanced
+
+### Error Handling
+
+The package uses a Result monad (`ok` / `err`) to handle errors gracefully without throwing runtime exceptions.
+
+```typescript
+if (!result.ok) {
+  switch (result.error.code) {
+    case "NETWORK_ERROR":
+      console.log("The bank's server is down or unreachable.");
+      break;
+    case "INVALID_REFERENCE":
+      console.log("The reference number doesn't match the bank's format.");
+      break;
+    case "ACCOUNT_MISMATCH":
+      console.log("The money was sent to the wrong account!");
+      break;
+    case "NOT_FOUND":
+      console.log("Transaction not found. This receipt might be fake.");
+      break;
+  }
+}
+```
 
 ## License
 
-MIT
+MIT License. See `LICENSE` for details.

@@ -5,4 +5,4 @@
  * Delegates to the compiled TypeScript CLI logic.
  */
 
-require('../dist/cli.js');
+import('../dist/cli.js');

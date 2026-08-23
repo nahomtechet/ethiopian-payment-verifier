@@ -1,0 +1,95 @@
+import * as https from "node:https";
+import { getAllBanks } from "../manifest/loader.js";
+import { getParser } from "../parsers/registry.js";
+
+export interface BankHealthStatus {
+  id: string;
+  name: string;
+  status: "reachable" | "unreachable" | "geo-blocked" | "no-parser" | "in-development";
+  latencyMs: number;
+}
+
+function checkEndpoint(url: string, sslVerify: boolean, timeoutMs: number = 5000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (!sslVerify) {
+      // Use node:https with SSL verification disabled for banks with broken certs (like Awash)
+      const req = https.get(
+        url,
+        { headers: { "User-Agent": "cheki-health-check" }, rejectUnauthorized: false },
+        (res) => {
+          // If we got a response (even 4xx/5xx), the endpoint is technically reachable
+          resolve();
+        }
+      );
+      req.on("error", reject);
+      req.setTimeout(timeoutMs, () => req.destroy(new Error("timeout")));
+      return;
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    fetch(url, {
+      method: "GET",
+      signal: controller.signal,
+      headers: { "User-Agent": "cheki-health-check" },
+    })
+      .then(() => {
+        clearTimeout(timeout);
+        resolve();
+      })
+      .catch((e) => {
+        clearTimeout(timeout);
+        reject(e);
+      });
+  });
+}
+
+/**
+ * Pings all banks to check if their endpoints are reachable.
+ * Returns an array of health statuses.
+ */
+export async function checkSystemHealth(): Promise<BankHealthStatus[]> {
+  const banks = getAllBanks();
+  const checks = await Promise.all(
+    banks.map(async (b): Promise<BankHealthStatus> => {
+      const start = Date.now();
+      const parser = getParser(b.id);
+      
+      if (!parser || b.status !== "live") {
+        return {
+          id: b.id,
+          name: b.name,
+          status: b.status === "live" ? "no-parser" : "in-development",
+          latencyMs: 0,
+        };
+      }
+      
+      try {
+        const url = b.endpoint
+          .replace("{ref}", "test")
+          .replace("{account}", "00000000")
+          .replace("{phone}", "0000000000");
+          
+        // CBE legacy PDF endpoint is slow — give it 15s in health checks
+        const healthTimeout = b.id === "cbe" ? 15000 : 5000;
+        await checkEndpoint(url, b.sslVerify, healthTimeout);
+        
+        return {
+          id: b.id,
+          name: b.name,
+          status: "reachable",
+          latencyMs: Date.now() - start,
+        };
+      } catch {
+        return {
+          id: b.id,
+          name: b.name,
+          status: (b.id === "telebirr" || b.id === "mpesa") ? "geo-blocked" : "unreachable",
+          latencyMs: Date.now() - start,
+        };
+      }
+    })
+  );
+
+  return checks;
+}
